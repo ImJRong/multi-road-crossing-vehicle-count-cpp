@@ -1,0 +1,16 @@
+# 统一行尾：仓库内一律存 LF，检出时按各平台 core.autocrlf 决定
+# 这样 Windows 与 WSL 两份工作区 md5 不会因为 CRLF/LF 而误报差异
+* text=auto
+
+# 二进制文件，不做任何行尾转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.mp4 binary
+*.onnx binary
+*.rknn binary
+*.pt binary
+*.npy binary
+*.zip binary
