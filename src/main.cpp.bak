@@ -1,0 +1,266 @@
+// 多路口车流量统计 —— C++ 版入口 (板端用).
+//
+// 现在这一版: 读配置 -> 读视频 -> ONNX 推理 -> 画框/线/数字 -> 播放或存视频.
+// 跟踪和计数还没接(要自己实现 ByteTrack), 所以数字仍然是 0.
+//
+// 用法:
+//   ./traffic_count test4
+// 不带参数就列出现有配置. 退出: 窗口里按 Q 或 Esc.
+#include <chrono>
+#include <cstdio>
+#include <exception>
+#include <filesystem>
+#include <string>
+#include <vector>
+
+#include <opencv2/opencv.hpp>
+
+#include "config.hpp"
+#include "counter.hpp"
+#include "detector.hpp"
+
+#ifndef TRAFFIC_PROJECT_ROOT
+#define TRAFFIC_PROJECT_ROOT "."
+#endif
+#ifndef TRAFFIC_MODEL
+#define TRAFFIC_MODEL TRAFFIC_PROJECT_ROOT "/models/best_detrac.onnx"
+#endif
+
+namespace fs = std::filesystem;
+
+namespace {
+
+const std::string kRoot = TRAFFIC_PROJECT_ROOT;
+const std::string kModel = TRAFFIC_MODEL;
+
+std::string resolve_config_path(const std::string& arg) {
+  if (arg.find('/') != std::string::npos) return arg;
+  if (arg.size() > 5 && arg.compare(arg.size() - 5, 5, ".json") == 0)
+    return kRoot + "/configs/" + arg;
+  return kRoot + "/configs/" + arg + ".json";
+}
+
+std::vector<std::string> list_configs() {
+  std::vector<std::string> names;
+  const std::string dir = kRoot + "/configs";
+  std::error_code ec;
+  if (!fs::is_directory(dir, ec)) return names;
+  for (const auto& entry : fs::directory_iterator(dir, ec)) {
+    if (!entry.is_regular_file()) continue;
+    const std::string fn = entry.path().filename().string();
+    if (fn.size() > 5 && fn.compare(fn.size() - 5, 5, ".json") == 0)
+      names.push_back(fn.substr(0, fn.size() - 5));
+  }
+  std::sort(names.begin(), names.end());
+  return names;
+}
+
+bool video_ok(const std::string& path) {
+  cv::VideoCapture probe(path);
+  return probe.isOpened();
+}
+
+std::string resolve_video_path(const std::string& video, const std::string& cfg_path) {
+  if (!video.empty() && video[0] == '/') return video;
+
+  const size_t slash = cfg_path.find_last_of('/');
+  const std::string cfg_dir = slash == std::string::npos ? "" : cfg_path.substr(0, slash + 1);
+
+  const std::string candidates[] = {
+      video, cfg_dir + video, kRoot + "/" + video, cfg_dir + "../" + video,
+  };
+  for (const auto& c : candidates) {
+    if (video_ok(c)) return c;
+  }
+  return kRoot + "/" + video;
+}
+
+cv::Scalar to_scalar(const std::array<int, 3>& c) { return cv::Scalar(c[0], c[1], c[2]); }
+std::vector<cv::Point> to_cv_poly(const std::vector<Point>& pts) {
+  std::vector<cv::Point> out;
+  for (const auto& p : pts) out.emplace_back(static_cast<int>(p.x), static_cast<int>(p.y));
+  return out;
+}
+
+
+void draw_detections(cv::Mat& frame, const std::vector<Detection>& dets, const Config& cfg) {
+  if (!cfg.draw.box) return;
+  for (const auto& d : dets) {
+    cv::Rect rect(static_cast<int>(d.x1), static_cast<int>(d.y1),
+                  static_cast<int>(d.x2 - d.x1), static_cast<int>(d.y2 - d.y1));
+    cv::rectangle(frame, rect, to_scalar(cfg.draw.box_color), cfg.draw.box_width);
+    if (cfg.draw.label) {
+      char txt[64];
+      std::snprintf(txt, sizeof(txt), "%.2f", d.score);
+      cv::putText(frame, txt, cv::Point(rect.x, std::max(12, rect.y - 6)),
+                  cv::FONT_HERSHEY_SIMPLEX, cfg.draw.font_scale,
+                  to_scalar(cfg.draw.box_color), cfg.draw.text_width);
+    }
+  }
+}
+
+void draw_counters(cv::Mat& frame, const Config& cfg, const Counter& counter) {
+  std::vector<cv::Rect> placed;
+  for (size_t i = 0; i < cfg.lines.size(); ++i) {
+    const Line& L = cfg.lines[i];
+    const cv::Point a(static_cast<int>(L.a.x), static_cast<int>(L.a.y));
+    const cv::Point b(static_cast<int>(L.b.x), static_cast<int>(L.b.y));
+    cv::line(frame, a, b, to_scalar(cfg.draw.line_color), cfg.draw.line_width);
+
+    char txt[64];
+    std::snprintf(txt, sizeof(txt), "%s: %d", L.name.c_str(), counter.count(i));
+    int baseline = 0;
+    const cv::Size ts = cv::getTextSize(txt, cv::FONT_HERSHEY_SIMPLEX,
+                                        cfg.draw.counter_scale, cfg.draw.text_width,
+                                        &baseline);
+    int tx, ty;
+    if (L.has_label_at) {
+      tx = static_cast<int>(L.label_at.x);
+      ty = static_cast<int>(L.label_at.y);
+    } else {
+      const cv::Point p = (a.y <= b.y) ? a : b;
+      tx = p.x + 6;
+      ty = (p.y - 10 > ts.height + 6) ? p.y - 10 : p.y + 26;
+    }
+    for (int k = 0; k < 6; ++k) {
+      cv::Rect box(tx, ty - ts.height, ts.width, ts.height + 4);
+      bool clash = false;
+      for (const auto& q : placed) {
+        if ((box & q).area() > 0) {
+          clash = true;
+          break;
+        }
+      }
+      if (!clash) break;
+      ty += ts.height + 6;
+    }
+    placed.emplace_back(tx, ty - ts.height, ts.width, ts.height + 4);
+    cv::putText(frame, txt, cv::Point(tx, ty), cv::FONT_HERSHEY_SIMPLEX,
+                cfg.draw.counter_scale, to_scalar(cfg.draw.text_color), cfg.draw.text_width);
+  }
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  if (argc < 2) {
+    std::printf("用法: %s <配置名>\n", argv[0]);
+    std::printf("现有配置 (%s/configs):\n", kRoot.c_str());
+    for (const auto& n : list_configs()) std::printf("  %s\n", n.c_str());
+    return 1;
+  }
+  if (argc > 2) {
+    std::fprintf(stderr, "用法: %s <配置名>\n", argv[0]);
+    return 1;
+  }
+
+  try {
+    const std::string cfg_path = resolve_config_path(argv[1]);
+    const Config cfg = load_config(cfg_path);
+    const std::string video_path = resolve_video_path(cfg.video, cfg_path);
+
+    std::printf("配置: %s\n视频: %s\n模型: %s\n", cfg_path.c_str(), video_path.c_str(),
+                kModel.c_str());
+
+    cv::VideoCapture cap(video_path);
+    if (!cap.isOpened()) {
+      std::fprintf(stderr, "打不开视频: %s\n", video_path.c_str());
+      return 1;
+    }
+
+    const int width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
+    const int height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+    const double fps = cap.get(cv::CAP_PROP_FPS);
+    std::printf("画面: %dx%d  %.1f fps\n", width, height, fps);
+    std::printf("线: %zu 条  ROI: %s\n", cfg.lines.size(), cfg.has_roi ? "有" : "无(整帧)");
+        // ROI: 外接矩形用来裁图, 多边形用来判"框中心在不在区域内" (跟 Python 版同样两步)
+    std::vector<cv::Point> poly;
+    cv::Rect roi_rect(0, 0, width, height);
+    if (cfg.has_roi && cfg.roi.size() >= 3) {
+      poly = to_cv_poly(cfg.roi);
+      roi_rect = cv::boundingRect(poly) & cv::Rect(0, 0, width, height);
+      if (roi_rect.width <= 0 || roi_rect.height <= 0) {   // 配置写歪了, 退回整帧
+        roi_rect = cv::Rect(0, 0, width, height);
+        poly.clear();
+      }
+    }
+    std::printf("推理区域: x%d~%d y%d~%d (%dx%d)  ROI过滤: %s\n",
+                roi_rect.x, roi_rect.x + roi_rect.width,
+                roi_rect.y, roi_rect.y + roi_rect.height,
+                roi_rect.width, roi_rect.height, poly.empty() ? "关" : "开");
+
+    Detector detector(kModel, cfg.detect.imgsz, cfg.detect.conf, cfg.detect.iou);
+
+    cv::VideoWriter writer;
+    const bool to_file = (cfg.output != "show");
+    if (to_file) {
+      const std::string out = "output/" + cfg.name + "_lanes.mp4";
+
+      writer.open(out, cv::VideoWriter::fourcc('m', 'p', '4', 'v'), fps,
+                  cv::Size(width, height));
+      std::printf("输出视频: %s\n", out.c_str());
+    }
+
+    Counter counter(cfg.lines);
+    cv::Mat frame;
+    int frame_no = 0;
+    int total_boxes = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+
+    while (cap.read(frame)) {
+      ++frame_no;
+
+            cv::Mat crop = frame(roi_rect);
+      std::vector<Detection> dets = detector.detect(crop);
+
+      for (auto& d : dets) {
+        d.x1 += roi_rect.x; d.x2 += roi_rect.x;
+        d.y1 += roi_rect.y; d.y2 += roi_rect.y;
+      }
+
+      if (!poly.empty()) {
+        dets.erase(std::remove_if(dets.begin(), dets.end(),
+                                  [&](const Detection& d) {
+                                    const cv::Point2f c(static_cast<float>((d.x1 + d.x2) * 0.5),
+                                                        static_cast<float>((d.y1 + d.y2) * 0.5));
+                                    return cv::pointPolygonTest(poly, c, false) < 0;
+                                  }),
+                   dets.end());
+      }
+
+      total_boxes += static_cast<int>(dets.size());
+
+      if (cfg.has_roi && cfg.draw.roi) {
+        const std::vector<cv::Point> poly = to_cv_poly(cfg.roi);
+        cv::polylines(frame, poly, true, to_scalar(cfg.draw.roi_color), 2);
+      }
+      draw_detections(frame, dets, cfg);
+      draw_counters(frame, cfg, counter);
+
+      if (to_file) {
+        writer.write(frame);
+      } else {
+        cv::imshow(cfg.name, frame);
+        const int key = cv::waitKey(1) & 0xFF;
+        if (key == 27 || key == 'q' || key == 'Q') break;
+      }
+
+      if (cfg.max_frames > 0 && frame_no >= cfg.max_frames) break;
+    }
+
+    if (writer.isOpened()) writer.release();
+
+    const auto t1 = std::chrono::steady_clock::now();
+    const double sec = std::chrono::duration<double>(t1 - t0).count();
+    std::printf("共 %d 帧, %.2f 秒, %.1f 帧/秒, 平均每帧 %.1f 个框\n", frame_no, sec,
+                sec > 0 ? frame_no / sec : 0.0,
+                frame_no > 0 ? static_cast<double>(total_boxes) / frame_no : 0.0);
+    for (size_t i = 0; i < cfg.lines.size(); ++i) {
+      std::printf("  %s: %d\n", cfg.lines[i].name.c_str(), counter.count(i));
+    }
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "出错: %s\n", e.what());
+    return 1;
+  }
+  return 0;
+}

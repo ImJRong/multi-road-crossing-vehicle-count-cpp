@@ -1,0 +1,15 @@
+# 编译产物
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+
+# 可执行文件
+traffic_count
+bench
+
+# 输出
+output/
+*.mp4
