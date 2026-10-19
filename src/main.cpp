@@ -26,7 +26,16 @@
 
 #include "config.hpp"
 #include "counter.hpp"
+//#include "detector.hpp"
+#ifdef USE_RKNN
+#include "rknn_detector.hpp"
+using Detector = RknnDetector;
+#else
 #include "detector.hpp"
+#endif
+
+#include "recorder.hpp"
+
 
 #ifndef TRAFFIC_PROJECT_ROOT
 #define TRAFFIC_PROJECT_ROOT "."
@@ -391,6 +400,7 @@ int main(int argc, char** argv) {
     }
 
     if (writer.isOpened()) writer.release();
+    write_records(std::string("output/records_") + cfg.name + ".csv", counter);
 
     const auto t1 = std::chrono::steady_clock::now();
     const double sec = std::chrono::duration<double>(t1 - t0).count();
