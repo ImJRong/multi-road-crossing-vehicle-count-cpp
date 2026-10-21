@@ -13,13 +13,7 @@
 
 #include <onnxruntime_cxx_api.h>
 
-// 一个检测框. 坐标是【原图】坐标, 不是 640 输入图上的坐标.
-// 也就是说 detect() 返回之前, 已经把 letterbox 的缩放和补边还原回去了.
-struct Detection {
-  double x1 = 0, y1 = 0, x2 = 0, y2 = 0;   // 左上角 + 右下角
-  double score = 0;                        // 置信度 0~1
-  int cls = 0;                             // 类别号. 自训模型只有 0 = vehicle
-};
+#include "detection.hpp"   // Detection 定义在这里, 和 RKNN 版共用
 
 class Detector {
  public:

@@ -48,7 +48,7 @@ set(RKNN_ROOT "$ENV{HOME}/rknn_runtime" CACHE PATH "librknnrt 所在目录")
 
 
 # ---- 3. 编译主程序 ---------------------------------------------------------
-# 两个后端用不同的源文件, 但 main.cpp / config.cpp / counter.cpp 是共用的.
+# 两个后端用不同的推理源文件, 但 main / config / counter / tracker 是共用的.
 # 这就是把推理拆成一个类的价值: 换后端只换一个 .cpp.
 if(USE_RKNN)
   message(STATUS "推理后端: RKNN (${RKNN_ROOT})")
@@ -56,6 +56,7 @@ if(USE_RKNN)
     src/main.cpp
     src/config.cpp
     src/counter.cpp
+    src/tracker.cpp
     src/rknn_detector.cpp     # RKNN 版: rknn_init / rknn_run / rknn_outputs_get
   )
   target_include_directories(traffic_count PRIVATE
@@ -77,6 +78,7 @@ else()
     src/main.cpp        # 入口: 读配置、跑循环、画图
     src/config.cpp      # 解析 configs/*.json
     src/counter.cpp     # 穿线计数
+    src/tracker.cpp     # 跟踪: 卡尔曼预测 + IoU 匹配发编号
     src/detector.cpp    # ONNX 推理 + 前后处理
   )
   target_include_directories(traffic_count PRIVATE

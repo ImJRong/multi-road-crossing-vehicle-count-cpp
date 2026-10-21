@@ -14,12 +14,7 @@
 
 #include <opencv2/opencv.hpp>
 
-// 一个检测框. 坐标是【原图】坐标, 不是 640 输入图上的坐标.
-struct Detection {
-  double x1 = 0, y1 = 0, x2 = 0, y2 = 0;
-  double score = 0;
-  int cls = 0;
-};
+#include "detection.hpp"   // Detection 定义在这里, 和 ONNX 版共用
 
 class RknnDetector {
  public:
