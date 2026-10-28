@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>车流量统计 · 监控台</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: #F5F6F8; color: #1F2329;
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    font-size: 13px;
+  }
+  .app { height: 100%; display: flex; flex-direction: column; padding: 12px; gap: 10px; }
+
+  header {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    background: #fff; border: 1px solid #E8EAED; border-radius: 10px; padding: 10px 14px;
+  }
+  header .title { font-size: 14px; font-weight: 500; margin-right: 6px; }
+  select, button {
+    font-family: inherit; font-size: 13px; padding: 6px 10px;
+    border: 1px solid #D8DCE1; border-radius: 7px; background: #fff; color: #1F2329;
+    cursor: pointer;
+  }
+  button:hover { background: #F2F4F7; }
+  button.primary { background: #185FA5; border-color: #185FA5; color: #fff; }
+  button.primary:hover { background: #144E8A; }
+  button.danger { color: #A32D2D; border-color: #F0C4C4; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #B4B2A9; display: inline-block; }
+  .dot.run { background: #1D9E75; }
+  .dot.pause { background: #EF9F27; }
+  .status { display: flex; align-items: center; gap: 6px; color: #6B7280; margin-left: auto; }
+  .warn { color: #A32D2D; font-size: 12px; }
+
+  main { flex: 1; display: grid; grid-template-columns: minmax(0,1fr) 292px; gap: 10px; min-height: 0; }
+  .video {
+    background: #14161A; border-radius: 10px; overflow: hidden;
+    display: flex; align-items: center; justify-content: center; min-height: 0;
+  }
+  .video img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; }
+  .placeholder { color: #6B7280; font-size: 13px; }
+
+  aside { display: flex; flex-direction: column; gap: 10px; min-height: 0; overflow-y: auto; }
+  .card { background: #fff; border: 1px solid #E8EAED; border-radius: 10px; padding: 12px; }
+  .card h4 { margin: 0 0 10px; font-size: 12px; font-weight: 500; color: #6B7280; }
+
+  .lines { display: flex; flex-wrap: wrap; gap: 8px; }
+  .linebox { background: #F5F6F8; border-radius: 8px; padding: 8px 12px; min-width: 76px; }
+  .linebox .n { font-size: 11px; color: #6B7280; }
+  .linebox .v { font-size: 22px; font-weight: 500; line-height: 1.2; }
+  .muted { color: #6B7280; font-size: 12px; }
+
+  label.row { display: flex; align-items: center; gap: 7px; margin-bottom: 7px; cursor: pointer; user-select: none; }
+  label.row input { margin: 0; accent-color: #185FA5; }
+
+  .slider { margin-bottom: 10px; }
+  .slider .lab { display: flex; justify-content: space-between; font-size: 12px; color: #6B7280; margin-bottom: 2px; }
+  .slider input[type=range] { width: 100%; accent-color: #185FA5; }
+
+  .events { background: #fff; border: 1px solid #E8EAED; border-radius: 10px; padding: 10px 12px; height: 158px; display: flex; flex-direction: column; }
+  .events .head { font-size: 12px; font-weight: 500; color: #6B7280; margin-bottom: 8px; display: flex; justify-content: space-between; }
+  .evlist { flex: 1; display: flex; gap: 8px; overflow-x: auto; }
+  .ev { flex: 0 0 142px; background: #F5F6F8; border-radius: 8px; overflow: hidden; }
+  .ev img { width: 100%; height: 76px; object-fit: cover; display: block; background: #E8EAED; cursor: zoom-in; }
+  .ev img:hover { opacity: .85; }
+  .ev .meta { padding: 4px 6px; font-size: 11px; color: #444441; line-height: 1.4; }
+  .ev .meta b { font-weight: 500; color: #185FA5; }
+
+  .lightbox {
+    position: fixed; inset: 0; background: rgba(0,0,0,.84);
+    display: none; align-items: center; justify-content: center;
+    z-index: 99; cursor: zoom-out;
+  }
+  .lightbox img { max-width: 92vw; max-height: 88vh; border-radius: 6px; background: #222; }
+  .lightbox .hint { position: absolute; bottom: 18px; color: #CCC; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <span class="title">车流量统计</span>
+    <select id="cfg"><option>加载中…</option></select>
+    <button id="btn-start" class="primary">开始</button>
+    <button id="btn-pause" disabled>暂停</button>
+    <button id="btn-restart" disabled>重新开始</button>
+    <button id="btn-stop" class="danger" disabled>停止</button>
+    <span class="warn" id="warn"></span>
+    <span class="status"><span class="dot" id="dot"></span><span id="statustext">空闲</span></span>
+  </header>
+
+  <main>
+    <div class="video">
+      <img id="stream" alt="实时画面" style="display:none">
+      <span class="placeholder" id="ph">选择配置后点「开始」</span>
+    </div>
+
+    <aside>
+      <div class="card">
+        <h4>计数</h4>
+        <div class="lines" id="lines"><span class="muted">还没开始</span></div>
+        <div class="muted" style="margin-top:10px">
+          跟踪 <b id="tracks">0</b> 个 · <b id="fps">0</b> fps · 单帧 <b id="infer">0</b> ms
+        </div>
+      </div>
+
+      <div class="card">
+        <h4>图层</h4>
+        <label class="row"><input type="checkbox" id="ly-box" checked>检测框</label>
+        <label class="row"><input type="checkbox" id="ly-id" checked>跟踪编号</label>
+        <label class="row"><input type="checkbox" id="ly-line" checked>计数线与数字</label>
+        <label class="row"><input type="checkbox" id="ly-roi" checked>检测区域</label>
+      </div>
+
+      <div class="card">
+        <h4>参数（改内存，不动 json）</h4>
+        <div class="slider">
+          <div class="lab"><span>置信度 conf</span><span id="v-conf">0.30</span></div>
+          <input type="range" id="s-conf" min="5" max="95" value="30">
+        </div>
+        <div class="slider">
+          <div class="lab"><span>NMS iou</span><span id="v-iou">0.50</span></div>
+          <input type="range" id="s-iou" min="5" max="95" value="50">
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <div class="events">
+    <div class="head"><span>过车记录（点图看大图）</span><span id="evcount">0 条</span></div>
+    <div class="evlist" id="evlist"><span class="muted">还没有记录</span></div>
+  </div>
+</div>
+
+<div class="lightbox" id="lightbox">
+  <img id="boximg" alt="过车抓拍">
+  <div class="hint">点击任意处或按 Esc 关闭</div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let running = false, paused = false;
+
+function setState(st) {
+  paused = (st === 2);
+  running = (st === 1 || st === 2);
+  $('dot').className = 'dot' + (st === 1 ? ' run' : st === 2 ? ' pause' : '');
+  $('statustext').textContent = st === 1 ? '运行中' : st === 2 ? '暂停' : '空闲';
+  // 「开始」运行中不禁用 —— 它兼作「换一路」用
+  $('btn-start').textContent = running ? '切换' : '开始';
+  $('btn-stop').disabled = !running;
+  $('btn-pause').disabled = !running;
+  $('btn-restart').disabled = !running;
+  $('btn-pause').textContent = paused ? '继续' : '暂停';
+}
+
+async function jget(url) {
+  const r = await fetch(url, { cache: 'no-store' });
+  return r.json();
+}
+
+// 列出 configs/ 下的配置. 一个都没有就直接标红, 不要偷偷塞个 test1 假装能用
+function loadConfigs() {
+  const sel = $('cfg');
+  fetch('/api/configs', { cache: 'no-store' }).then(r => r.json()).then(d => {
+    const list = d.configs || [];
+    sel.innerHTML = '';
+    if (!list.length) {
+      sel.innerHTML = '<option value="">（configs 里没有 .json）</option>';
+      $('warn').textContent = '读不到配置：检查 TRAFFIC_PROJECT_ROOT 下的 configs/';
+      return;
+    }
+    $('warn').textContent = '';
+    list.forEach(n => {
+      const o = document.createElement('option');
+      o.value = n; o.textContent = n;
+      sel.appendChild(o);
+    });
+  }).catch(() => {
+    sel.innerHTML = '<option value="">（接口没响应）</option>';
+    $('warn').textContent = '连不上 /api/configs';
+  });
+}
+loadConfigs();
+
+let syncParams = false;   // 切到新配置后, 把服务端的初始参数同步到滑块上
+
+$('btn-start').onclick = () => {
+  const name = $('cfg').value;
+  if (!name) { $('warn').textContent = '先选一个配置'; return; }
+  $('warn').textContent = '';
+  $('ph').style.display = 'none';
+  const img = $('stream');
+  img.src = '/stream?t=' + Date.now();
+  img.style.display = 'block';
+  jget('/api/start?config=' + encodeURIComponent(name));
+  $('evlist').innerHTML = '<span class="muted">还没有记录</span>';
+  syncParams = true;
+  setState(1);
+};
+
+$('btn-pause').onclick = () => {
+  const next = !paused;
+  jget('/api/pause?on=' + (next ? 1 : 0));
+  setState(next ? 2 : 1);
+};
+
+$('btn-restart').onclick = () => {
+  jget('/api/restart');
+  $('evlist').innerHTML = '<span class="muted">还没有记录</span>';
+  syncParams = true;
+  setState(1);
+};
+
+$('btn-stop').onclick = () => {
+  jget('/api/stop');
+  $('stream').style.display = 'none';
+  $('ph').style.display = 'block';
+  setState(0);
+};
+
+let reconnect = null;
+$('stream').onerror = () => {
+  clearTimeout(reconnect);
+  reconnect = setTimeout(() => {
+    if (running) $('stream').src = '/stream?t=' + Date.now();
+  }, 2000);
+};
+
+document.querySelectorAll('.row input').forEach(el => {
+  el.onchange = () => {
+    const k = el.id.replace('ly-', '');
+    jget('/api/overlay?' + k + '=' + (el.checked ? 1 : 0));
+  };
+});
+
+let lastConf = 30, lastIou = 50, paramTimer = null;
+function pushParam() {
+  clearTimeout(paramTimer);
+  paramTimer = setTimeout(() => {
+    jget('/api/param?conf=' + (lastConf / 100).toFixed(2) + '&iou=' + (lastIou / 100).toFixed(2));
+  }, 150);
+}
+$('s-conf').oninput = e => { lastConf = +e.target.value; $('v-conf').textContent = (lastConf / 100).toFixed(2); pushParam(); };
+$('s-iou').oninput = e => { lastIou = +e.target.value; $('v-iou').textContent = (lastIou / 100).toFixed(2); pushParam(); };
+
+function pollState() {
+  jget('/api/state').then(s => {
+    if (!s || !s.lines) return;
+    // 只在本后端"主动"结束时同步状态, 其余以本地按钮为准
+    if (s.state === 2 && running && !paused) setState(2);
+    if (s.state === 0 && running) setState(0);
+
+    // 切配置后第一次拿到状态: 把 json 里的 conf/iou 同步到滑块上
+    if (syncParams && typeof s.conf === 'number') {
+      syncParams = false;
+      lastConf = Math.round(s.conf * 100);
+      lastIou = Math.round(s.iou * 100);
+      $('s-conf').value = lastConf;
+      $('s-iou').value = lastIou;
+      $('v-conf').textContent = s.conf.toFixed(2);
+      $('v-iou').textContent = s.iou.toFixed(2);
+    }
+
+    $('tracks').textContent = s.tracks ?? 0;
+    $('fps').textContent = (s.fps ?? 0).toFixed(1);
+    $('infer').textContent = (s.infer ?? 0).toFixed(1);
+    renderLines(s.lines);
+  }).catch(() => {});
+}
+
+function renderLines(lines) {
+  if (!lines.length) return;
+  const box = $('lines');
+  if (box.dataset.n !== String(lines.length)) {
+    box.innerHTML = '';
+    lines.forEach(L => {
+      const d = document.createElement('div');
+      d.className = 'linebox';
+      d.innerHTML = '<div class="n">' + L.name + '</div><div class="v" id="c-' + L.name + '">0</div>';
+      box.appendChild(d);
+    });
+    box.dataset.n = String(lines.length);
+  }
+  lines.forEach(L => {
+    const el = document.getElementById('c-' + L.name);
+    if (el) el.textContent = L.count;
+  });
+}
+
+function fmt(sec) {
+  const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
+  return (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+}
+
+function pollEvents() {
+  jget('/api/events').then(d => {
+    const list = (d.events || []).slice(0, 40);
+    $('evcount').textContent = list.length + ' 条';
+    if (!list.length) { $('evlist').innerHTML = '<span class="muted">还没有记录</span>'; return; }
+    $('evlist').innerHTML = list.map(e => (
+      '<div class="ev">' +
+        (e.snap ? '<img src="/snap/' + e.snap + '" loading="lazy" title="点击看大图">' : '<div style="height:76px"></div>') +
+        '<div class="meta"><b>线 ' + e.line + '</b> · 第 ' + e.frame + ' 帧<br>' + fmt(e.ts) + '</div>' +
+      '</div>'
+    )).join('');
+  }).catch(() => {});
+}
+
+// ---- 抓拍大图 ----
+function showBox(src) {
+  $('boximg').src = src;
+  $('lightbox').style.display = 'flex';
+}
+function hideBox() {
+  $('lightbox').style.display = 'none';
+  $('boximg').src = '';
+}
+$('lightbox').onclick = hideBox;
+$('evlist').addEventListener('click', e => {
+  if (e.target.tagName === 'IMG') showBox(e.target.src);
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') hideBox();
+});
+
+setInterval(pollState, 400);
+setInterval(pollEvents, 1200);
+pollState();
+</script>
+</body>
+</html>
