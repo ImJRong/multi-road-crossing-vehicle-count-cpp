@@ -11,6 +11,18 @@
 //   ONNX Runtime 吃 NCHW（先通道、再高、再宽）
 //   RKNN 内部也是 NCHW（rknn_api.h 里写明 "internal input format of NPU is NCHW by default"）
 //   所以这里也传 NCHW, 免掉驱动再做一次转换.
+//
+// 两种模型, 一份代码:
+//   单输出 [1, 5, 8400]              —— 坐标和分数拼在一起, FP16 模型就是这个
+//   双输出 [1,4,8400] + [1,1,8400]   —— 拆开的 boxes / scores, INT8 模型必须是这个
+//
+// 为什么 INT8 要拆:
+//   量化把一个张量整体映射到 8 位整数, 一套 scale 管所有数. 坐标是 0~640, 分数是 0~1,
+//   共用 2.5 的步长时, 0.87 会被舍成 0 —— 分数全灭, 一个框都出不来.
+//   拆开后 boxes 用 2.5 的步长, scores 用 1/255 的步长, 各管各的, 分数就保住了.
+//
+// 这里的做法: 两个输出各自读, 但后面的过滤和 NMS 完全走同一条路,
+// 所以单输出模型和双输出模型的结果是一致可比的.
 
 #include "rknn_detector.hpp"
 
@@ -44,13 +56,27 @@ void check(int ret, const char* what) {
   }
 }
 
+// 打印一个 tensor 的 dims, 排查问题时最常看的就是这行
+void print_dims(const char* tag, const rknn_tensor_attr& a) {
+  std::printf("%s dims=[", tag);
+  for (uint32_t i = 0; i < a.n_dims; ++i) {
+    std::printf("%d%s", a.dims[i], i + 1 == a.n_dims ? "" : ", ");
+  }
+  std::printf("]\n");
+}
+
 }  // namespace
 
 struct RknnDetector::Impl {
   rknn_context ctx = 0;
   std::vector<unsigned char> model;   // 模型内容要一直留着, rknn_init 之后不能释放
-  int n_rows = 5;                     // 每个候选框 5 个数: cx cy w h score
+
+  int n_output = 1;                   // 模型有几个输出
+  int boxes_index = 0;                // 坐标在哪个输出里
+  int scores_index = -1;              // 分数在哪个输出里(-1 = 单输出, 分数跟在坐标后面)
+  int n_rows = 5;                     // 每个候选框一共 4+类别数 个数
   int n_cols = 8400;                  // 候选框个数
+  int n_cls = 1;                      // 类别数
 };
 
 RknnDetector::RknnDetector(const std::string& model_path, int imgsz, double conf, double iou)
@@ -79,29 +105,66 @@ RknnDetector::RknnDetector(const std::string& model_path, int imgsz, double conf
   in_attr.index = 0;
   check(rknn_query(impl_->ctx, RKNN_QUERY_INPUT_ATTR, &in_attr, sizeof(in_attr)),
         "rknn_query(INPUT_ATTR)");
-  std::printf("输入: dims=[");
-  for (uint32_t i = 0; i < in_attr.n_dims; ++i) {
-    std::printf("%d%s", in_attr.dims[i], i + 1 == in_attr.n_dims ? "" : ", ");
-  }
-  std::printf("] fmt=%d type=%d\n", static_cast<int>(in_attr.fmt),
+  print_dims("输入:", in_attr);
+  std::printf("      fmt=%d type=%d\n", static_cast<int>(in_attr.fmt),
               static_cast<int>(in_attr.type));
 
   // 5. 问输出的形状, 用它来定 n_rows / n_cols, 不写死
-  rknn_tensor_attr out_attr;
-  std::memset(&out_attr, 0, sizeof(out_attr));
-  out_attr.index = 0;
-  if (rknn_query(impl_->ctx, RKNN_QUERY_OUTPUT_ATTR, &out_attr, sizeof(out_attr)) == 0) {
-    if (out_attr.n_dims >= 3) {
-      impl_->n_rows = static_cast<int>(out_attr.dims[out_attr.n_dims - 2]);
-      impl_->n_cols = static_cast<int>(out_attr.dims[out_attr.n_dims - 1]);
+  impl_->n_output = static_cast<int>(io_num.n_output);
+  int cols = 0;
+
+  if (impl_->n_output == 1) {
+    // ---- 单输出: [1, 5, 8400], 前 4 行坐标, 第 5 行起是分数 ----
+    rknn_tensor_attr a;
+    std::memset(&a, 0, sizeof(a));
+    a.index = 0;
+    if (rknn_query(impl_->ctx, RKNN_QUERY_OUTPUT_ATTR, &a, sizeof(a)) == 0) {
+      print_dims("输出[0]:", a);
+      if (a.n_dims >= 3) {
+        impl_->n_rows = static_cast<int>(a.dims[a.n_dims - 2]);
+        cols = static_cast<int>(a.dims[a.n_dims - 1]);
+      }
     }
-    std::printf("输出: dims=[");
-    for (uint32_t i = 0; i < out_attr.n_dims; ++i) {
-      std::printf("%d%s", out_attr.dims[i], i + 1 == out_attr.n_dims ? "" : ", ");
+    impl_->n_cls = impl_->n_rows - 4;
+    impl_->scores_index = -1;
+  } else {
+    // ---- 双输出: 一个 [1, 4, 8400] 放坐标, 一个 [1, C, 8400] 放分数 ----
+    // 不靠输出顺序猜, 按"行数"认: 4 行的那个是坐标, 其余的是分数.
+    int rows_boxes = 0;
+    int rows_scores = 0;
+    for (int i = 0; i < impl_->n_output; ++i) {
+      rknn_tensor_attr a;
+      std::memset(&a, 0, sizeof(a));
+      a.index = i;
+      if (rknn_query(impl_->ctx, RKNN_QUERY_OUTPUT_ATTR, &a, sizeof(a)) != 0) continue;
+      char tag[32];
+      std::snprintf(tag, sizeof(tag), "输出[%d]:", i);
+      print_dims(tag, a);
+      if (a.n_dims < 3) continue;
+      const int r = static_cast<int>(a.dims[a.n_dims - 2]);
+      const int c = static_cast<int>(a.dims[a.n_dims - 1]);
+      if (c > cols) cols = c;
+      if (r == 4) {
+        impl_->boxes_index = i;
+        rows_boxes = r;
+      } else if (r > 0) {
+        impl_->scores_index = i;
+        rows_scores = r;
+      }
     }
-    std::printf("]\n");
+    if (impl_->scores_index < 0 || rows_boxes == 0) {
+      throw std::runtime_error(
+          "这个模型有多个输出, 但认不出哪路是坐标(4 行)、哪路是分数. "
+          "预期是 [1,4,8400] + [1,C,8400], 实际形状看上面的打印.");
+    }
+    impl_->n_rows = rows_boxes + rows_scores;
+    impl_->n_cls = rows_scores;
   }
-  std::printf("按 [%d, %d] 解析输出 (行=坐标和分数, 列=候选框)\n", impl_->n_rows, impl_->n_cols);
+
+  impl_->n_cols = cols > 0 ? cols : 8400;
+  std::printf("按 %s 解析: 类别 %d 个, 候选框 %d 个\n",
+              impl_->n_output == 1 ? "单输出 [4+C, N]" : "双输出 boxes/scores", impl_->n_cls,
+              impl_->n_cols);
 }
 
 RknnDetector::~RknnDetector() {
@@ -138,36 +201,51 @@ std::vector<Detection> RknnDetector::detect(const cv::Mat& frame) {
   check(rknn_inputs_set(impl_->ctx, 1, inputs), "rknn_inputs_set");
   check(rknn_run(impl_->ctx, nullptr), "rknn_run");
 
-  // ===== 第 3 步: 取输出 =====
-  rknn_output outputs[1];
-  std::memset(outputs, 0, sizeof(outputs));
-  outputs[0].want_float = 1;    // 要 float 结果, 省得自己反量化
-  outputs[0].is_prealloc = 0;   // 让库自己分配, 用完调 release
-  outputs[0].index = 0;
-  check(rknn_outputs_get(impl_->ctx, 1, outputs, nullptr), "rknn_outputs_get");
+  // ===== 第 3 步: 取输出(单输出取 1 个, 双输出取 2 个) =====
+  const int n_out = impl_->n_output;
+  std::vector<rknn_output> outputs(static_cast<size_t>(n_out));
+  for (int i = 0; i < n_out; ++i) {
+    std::memset(&outputs[static_cast<size_t>(i)], 0, sizeof(rknn_output));
+    outputs[static_cast<size_t>(i)].index = i;
+    outputs[static_cast<size_t>(i)].want_float = 1;    // 要 float, 省得自己反量化
+    outputs[static_cast<size_t>(i)].is_prealloc = 0;   // 让库自己分配, 用完调 release
+  }
+  check(rknn_outputs_get(impl_->ctx, n_out, outputs.data(), nullptr), "rknn_outputs_get");
 
-  const float* out = static_cast<const float*>(outputs[0].buf);
+  // 两种模型在这里归一成同一套读法: coord 前 4 行是 cx cy w h, score 是各类分数
+  const float* coord = nullptr;
+  const float* score = nullptr;
+  if (n_out == 1) {
+    // 单输出: 坐标和分数在同一个 buffer 里, 分数从第 4 行开始
+    coord = static_cast<const float*>(outputs[0].buf);
+    score = coord + static_cast<size_t>(4) * impl_->n_cols;
+  } else {
+    coord = static_cast<const float*>(outputs[static_cast<size_t>(impl_->boxes_index)].buf);
+    score = static_cast<const float*>(outputs[static_cast<size_t>(impl_->scores_index)].buf);
+  }
+
   const int n_cols = impl_->n_cols;
-  const int n_rows = impl_->n_rows;
+  const int n_cls = impl_->n_cls;
 
-  // ===== 第 4 步: 分数过滤. 布局和 ONNX 一样: out[c * n_cols + i] =====
+  // ===== 第 4 步: 分数过滤. 每个候选框取分数最高的类别 =====
   std::vector<Detection> boxes;
+  boxes.reserve(64);
   for (int i = 0; i < n_cols; ++i) {
     double best = 0;
     int best_c = 0;
-    for (int c = 4; c < n_rows; ++c) {
-      const double s = out[static_cast<size_t>(c) * n_cols + i];
+    for (int c = 0; c < n_cls; ++c) {
+      const double s = score[static_cast<size_t>(c) * n_cols + i];
       if (s > best) {
         best = s;
-        best_c = c - 4;
+        best_c = c;
       }
     }
     if (best < conf_) continue;
 
-    const double cx = out[static_cast<size_t>(0) * n_cols + i];
-    const double cy = out[static_cast<size_t>(1) * n_cols + i];
-    const double w = out[static_cast<size_t>(2) * n_cols + i];
-    const double h = out[static_cast<size_t>(3) * n_cols + i];
+    const double cx = coord[static_cast<size_t>(0) * n_cols + i];
+    const double cy = coord[static_cast<size_t>(1) * n_cols + i];
+    const double w = coord[static_cast<size_t>(2) * n_cols + i];
+    const double h = coord[static_cast<size_t>(3) * n_cols + i];
 
     Detection d;
     d.x1 = (cx - w / 2 - dx) / scale;
@@ -179,7 +257,7 @@ std::vector<Detection> RknnDetector::detect(const cv::Mat& frame) {
     boxes.push_back(d);
   }
 
-  rknn_outputs_release(impl_->ctx, 1, outputs);
+  rknn_outputs_release(impl_->ctx, n_out, outputs.data());
 
   // ===== 第 5 步: NMS, 和 ONNX 版一字不差 =====
   std::sort(boxes.begin(), boxes.end(),
