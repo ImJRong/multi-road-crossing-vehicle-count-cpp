@@ -236,9 +236,12 @@ std::vector<TrackView> Tracker::update(const std::vector<Detection>& dets) {
     if (t.state != TrackState::Tracked) continue;
     if (t.frame_id != frame_) continue;
 
+    // 输出框直接用卡尔曼滤波后的状态。
+    // 2026-11-01 删掉了这里的 EMA（0.6×旧 + 0.4×新）：它和卡尔曼重复平滑，
+    // 白白多 1~2 帧滞后，过线时刻被推迟，转弯车更容易漏计。
     TrackView v;
     v.id = t.id;
-    v.box = t.box;
+    v.box = t.kf.ready() ? t.kf.state() : t.box;
     const cv::Point2f d = center_of(t.box) - t.origin;
     v.moving = cv::norm(d) >= kMinTravel;   // 离出生点够远才算在开
     out.push_back(v);

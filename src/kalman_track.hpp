@@ -31,7 +31,10 @@ class KalmanBox {
 
     const float w = std::max(1.0f, box.width);
     const float h = std::max(1.0f, box.height);
-    const float std_pos = h / 20.0f;    // 位置误差
+    // 实测（test1 静止车 721 帧）：检测框中心抖动 σ≈0.8px，框宽抖动 2.7%
+    // 所以观测噪声取 2px 足够（留余量）；过程噪声同量级 -> K≈0.5，跟手又不抖
+    const float std_meas = 2.0f;        // 观测噪声(px)：实测 0.8，取 2 留余量
+    const float std_q = 2.0f;           // 过程噪声(px)：和观测同量级
     const float std_vel = h / 160.0f;   // 速度误差
 
     // 状态转移：位置 += 速度（一帧走一步）
@@ -44,16 +47,16 @@ class KalmanBox {
 
     // 过程噪声：位置那几项和观测噪声同量级，速度那几项小一个数量级
     cv::setIdentity(kf_->processNoiseCov);
-    for (int i = 0; i < 4; ++i) kf_->processNoiseCov.at<float>(i, i) = std_pos * std_pos;
+    for (int i = 0; i < 4; ++i) kf_->processNoiseCov.at<float>(i, i) = std_q * std_q;
     for (int i = 4; i < 8; ++i) kf_->processNoiseCov.at<float>(i, i) = std_vel * std_vel;
 
     // 观测噪声：检测框本身的误差
     cv::setIdentity(kf_->measurementNoiseCov);
-    for (int i = 0; i < 4; ++i) kf_->measurementNoiseCov.at<float>(i, i) = std_pos * std_pos;
+    for (int i = 0; i < 4; ++i) kf_->measurementNoiseCov.at<float>(i, i) = std_meas * std_meas;
 
     // 初始协方差：位置按 std_pos，速度完全不知道所以给个大值
     cv::setIdentity(kf_->errorCovPost);
-    for (int i = 0; i < 4; ++i) kf_->errorCovPost.at<float>(i, i) = std_pos * std_pos;
+    for (int i = 0; i < 4; ++i) kf_->errorCovPost.at<float>(i, i) = std_meas * std_meas;
     for (int i = 4; i < 8; ++i) kf_->errorCovPost.at<float>(i, i) = 1e4f;
 
     // 初始状态：位置就是检测框，速度 0。不调 correct，直接写进去。
@@ -88,6 +91,10 @@ class KalmanBox {
   bool ready() const { return kf_ != nullptr; }
 
   const cv::Rect2f& pred() const { return pred_; }
+
+  // 滤波后的当前状态（correct 之后的值）。输出框和计数都用它，
+  // 不要再在外面叠一层 EMA —— 那是重复平滑，只会多 1~2 帧滞后。
+  cv::Rect2f state() const { return kf_ ? to_rect(kf_->statePost) : pred_; }
 
  private:
   // 8 维状态的前 4 个是 cx, cy, w, h，还原成左上角 + 宽高

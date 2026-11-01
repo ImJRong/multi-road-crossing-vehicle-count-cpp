@@ -8,9 +8,25 @@ Makefile
 
 # 可执行文件
 traffic_count
+traffic_web
+traffic_web_single
+rknn_probe
 bench
 
 # 输出
 output/
 *.mp4
-src_bak*/
+
+# 模型权重: 体积大, 不进仓库. 转换脚本在 tools/ 里, 需要时自己转
+models/*.rknn
+models/*.onnx
+models/*.pt
+
+# 校准集清单: 里面是绝对路径, 各机器不同, 用时由脚本生成
+dataset_calib*.txt
+
+# 日志
+*.log
+
+data/videos
+

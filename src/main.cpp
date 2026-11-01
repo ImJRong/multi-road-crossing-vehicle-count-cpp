@@ -259,7 +259,7 @@ int main(int argc, char** argv) {
     // output 填 "save" 存 mp4, 填 "show" 开窗口实时播放.
     // 注意 output/ 是相对当前目录的, 所以在哪个目录跑就写到哪.
     cv::VideoWriter writer;
-    const bool to_file = (cfg.output != "show");
+    const bool to_file = (cfg.output == "save");
     if (to_file) {
       const std::string out = "output/" + cfg.name + "_lanes.mp4";
       writer.open(out, cv::VideoWriter::fourcc('m', 'p', '4', 'v'), fps,
@@ -317,6 +317,8 @@ int main(int argc, char** argv) {
         const cv::Point2f c = center_of(tr.box);
         counter.update(tr.id, Point{c.x, c.y}, "vehicle", frame_no);   // 判过线
       }
+      // 跟踪器删掉的 id（丢超过 30 帧）, 计数器那边也一并清掉, 免得越攒越多
+      counter.retain(tracker.live_ids());
       total_tracks = static_cast<int>(tracker.size());
 
       // 7.5 画: ROI 轮廓 -> 框和编号 -> 计数线和不数字
@@ -329,7 +331,7 @@ int main(int argc, char** argv) {
       // 7.6 输出: 存文件 或 显示窗口
       if (to_file) {
         writer.write(frame);
-      } else {
+      } else if (cfg.output == "show") {
         cv::imshow(cfg.name, frame);
         const int key = cv::waitKey(1) & 0xFF;
         if (key == 27 || key == 'q' || key == 'Q') break;   // Esc / Q 提前退出

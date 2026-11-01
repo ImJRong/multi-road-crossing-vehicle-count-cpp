@@ -131,4 +131,16 @@ class WebServer {
   std::atomic<float> conf_{0.3f};
   std::atomic<float> iou_{0.5f};
   std::atomic<int> state_{0};
+
+  // 系统状态：CPU 使用率 / 温度 / NPU GPU 频率
+  unsigned long long last_cpu_total_ = 0;
+  unsigned long long last_cpu_idle_ = 0;
+  double cpu_usage_ = 0.0;
+  double temp_c_ = 0.0;
+  int npu_mhz_ = 0;
+  int gpu_mhz_ = 0;
+  int npu_c0_ = 0;
+  int npu_c1_ = 0;
+  int npu_c2_ = 0;
+  void sample_sys();
 };

@@ -33,8 +33,8 @@ else()
   set(WEB_BACKEND_RPATH "${ORT_ROOT}/lib")
 endif()
 
-add_executable(traffic_web
-  src/web_main.cpp        # 入口: 会话管理 + 主循环 + 推帧
+add_executable(traffic_web_single
+  src/web_main_single.cpp # 入口: 会话管理 + 主循环 + 推帧
   src/web_server.cpp      # HTTP 服务: MJPEG 推流 / 状态 JSON / 控制命令
   src/config.cpp          # 和 traffic_count 共用, 不改
   src/counter.cpp
@@ -42,23 +42,23 @@ add_executable(traffic_web
   ${WEB_DETECTOR_SRC}
 )
 
-target_include_directories(traffic_web PRIVATE
+target_include_directories(traffic_web_single PRIVATE
   src
   ${WEB_BACKEND_INC}
   ${OpenCV_INCLUDE_DIRS}
 )
 
-target_compile_definitions(traffic_web PRIVATE
+target_compile_definitions(traffic_web_single PRIVATE
   ${WEB_DEFS}
   TRAFFIC_PROJECT_ROOT="${TRAFFIC_PROJECT_ROOT}"
   TRAFFIC_WEB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/web/index.html")
 
-target_link_libraries(traffic_web PRIVATE
+target_link_libraries(traffic_web_single PRIVATE
   ${WEB_BACKEND_LIB}
   ${OpenCV_LIBS}
   Threads::Threads)
 
-set_target_properties(traffic_web PROPERTIES
+set_target_properties(traffic_web_single PROPERTIES
   BUILD_RPATH "${WEB_BACKEND_RPATH}")
 
 # 全编: make          只编网页版: make traffic_web

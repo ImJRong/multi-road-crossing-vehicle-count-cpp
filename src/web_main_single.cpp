@@ -141,6 +141,14 @@ void draw_tracks(cv::Mat& frame, const std::vector<TrackView>& tracks, const Con
     const cv::Point br(cvRound(b.x + b.width), cvRound(b.y + b.height));
     if (ov.box) {
       cv::rectangle(frame, cv::Rect(tl, br), to_scalar(cfg.draw.box_color), cfg.draw.box_width);
+      // 中心点十字：计数就是拿这个点判在哪一侧
+      const int cx = cvRound(b.x + b.width * 0.5f);
+      const int cy = cvRound(b.y + b.height * 0.5f);
+      const int r = 7;
+      const cv::Scalar kCross(0, 255, 255);   // 黄色
+      cv::line(frame, cv::Point(cx - r, cy), cv::Point(cx + r, cy), kCross, 1);
+      cv::line(frame, cv::Point(cx, cy - r), cv::Point(cx, cy + r), kCross, 1);
+      cv::circle(frame, cv::Point(cx, cy), 2, kCross, -1);
     }
     if (ov.id) {
       char txt[32];
@@ -293,6 +301,9 @@ int main(int argc, char** argv) {
 
     // 打开(或重开)一次会话: 读配置 -> 开视频 -> 建计数器/跟踪器/检测器.
     // "开始"和"重新开始"都走这里, 区别只是要不要先清空现场.
+    // 配置里的 conf/iou 只在第一次启动时读；之后一直沿用网页上的值
+    bool params_inited = false;
+
     auto open_session = [&](const std::string& cfg_name) {
       s.reset();
       server.clear_events();
@@ -302,11 +313,19 @@ int main(int argc, char** argv) {
       s->prepare_geometry(w, h);
       s->counter = std::make_unique<Counter>(s->cfg.lines);
 
-      // 初始参数用配置文件里的值, 这样跟命令行版 traffic_count 跑出来的数字一致;
-      // 同时同步给 WebServer, 网页滑块上显示的就是实际在用的值
-      const float c0 = static_cast<float>(s->cfg.detect.conf);
-      const float i0 = static_cast<float>(s->cfg.detect.iou);
-      push_params(port, c0, i0);
+      // 第一次启动: 用配置文件里的 conf/iou, 并同步给网页输入框
+      // 之后切配置 / 重新开始: 沿用网页上当前的值, 不覆盖
+      float c0 = 0.f;
+      float i0 = 0.f;
+      if (!params_inited) {
+        params_inited = true;
+        c0 = static_cast<float>(s->cfg.detect.conf);
+        i0 = static_cast<float>(s->cfg.detect.iou);
+        push_params(port, c0, i0);
+      } else {
+        c0 = server.conf();
+        i0 = server.iou();
+      }
       s->build_detector(c0, i0);
 
       server.set_state(1);
@@ -409,6 +428,8 @@ int main(int argc, char** argv) {
         const cv::Point2f c = center_of(tr.box);
         s->counter->update(tr.id, Point{c.x, c.y}, "vehicle", s->frame_no);
       }
+      // 跟踪器删掉的 id（丢超过 30 帧）, 计数器那边也一并清掉, 免得越攒越多
+      s->counter->retain(s->tracker.live_ids());
       s->infer_ms =
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
@@ -445,6 +466,24 @@ int main(int argc, char** argv) {
 
       // ---- 7. 推帧 + 更新数字 ----
       server.push_frame(frame);
+
+      // ---- 7.5 按源视频帧率控制节奏, 让画面按原速播(不倍速快进) ----
+      {
+        static auto prev = std::chrono::steady_clock::now();
+        const double fps_src = s->cap.get(cv::CAP_PROP_FPS);
+        if (fps_src > 0.0) {
+          const double interval = 1000.0 / fps_src;
+          const auto now = std::chrono::steady_clock::now();
+          const double elapsed =
+              std::chrono::duration<double, std::milli>(now - prev).count();
+          const double wait = interval - elapsed;
+          if (wait > 0.0) {
+            std::this_thread::sleep_for(
+                std::chrono::microseconds(static_cast<long long>(wait * 1000)));
+          }
+          prev = std::chrono::steady_clock::now();
+        }
+      }
 
       const auto now = std::chrono::steady_clock::now();
       const double dt = std::chrono::duration<double>(now - last_tick).count();

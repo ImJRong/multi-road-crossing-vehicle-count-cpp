@@ -119,3 +119,25 @@ include(web.cmake)
 #
 # 全编:        make
 # 只编一个:    make bench
+
+# ---- 6. 模型体检工具 rknn_probe ----
+# 换新模型时先用它验一遍, 别拿业务程序去猜.
+# 用法: ./rknn_probe models/xxx.rknn data/videos/test1.mp4 200
+# 判据: scores 的 ==zp(-128) 约 8340 = 正常; 8400 = 分数全 0, 模型坏了.
+# 注意: 只在 USE_RKNN=ON 时才有这个目标.
+if(USE_RKNN)
+  add_executable(rknn_probe
+    src/rknn_probe.cpp
+  )
+  target_include_directories(rknn_probe PRIVATE
+    src
+    "${RKNN_ROOT}/include"
+    ${OpenCV_INCLUDE_DIRS}
+  )
+  target_link_libraries(rknn_probe PRIVATE
+    "${RKNN_ROOT}/lib/librknnrt.so"
+    ${OpenCV_LIBS}
+  )
+  set_target_properties(rknn_probe PROPERTIES
+    BUILD_RPATH "${RKNN_ROOT}/lib")
+endif()

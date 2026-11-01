@@ -27,6 +27,7 @@
 #include "rknn_detector.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -77,6 +78,12 @@ struct RknnDetector::Impl {
   int n_rows = 5;                     // 每个候选框一共 4+类别数 个数
   int n_cols = 8400;                  // 候选框个数
   int n_cls = 1;                      // 类别数
+
+  // 输出张量是不是 int8 量化。老模型(1.6.0 转的)输出 float32，这里是 false；
+  // 新模型(2.5.0)输出 int8，要按 (q - zp) * scale 自己反量化。
+  bool out_quant[2] = {false, false};
+  float out_scale[2] = {1.f, 1.f};
+  int out_zp[2] = {0, 0};
 };
 
 RknnDetector::RknnDetector(const std::string& model_path, int imgsz, double conf, double iou)
@@ -91,6 +98,13 @@ RknnDetector::RknnDetector(const std::string& model_path, int imgsz, double conf
   check(rknn_init(&impl_->ctx, impl_->model.data(),
                   static_cast<uint32_t>(impl_->model.size()), 0, nullptr),
         "rknn_init");
+
+  // RK3588 有 3 个 NPU 核, 默认只用一个。这里切到三核并行, 推理速度能上去一截。
+  if (rknn_set_core_mask(impl_->ctx, RKNN_NPU_CORE_0_1_2) == 0) {
+    std::printf("NPU: 三核并行已开启\n");
+  } else {
+    std::printf("NPU: 三核设置失败, 继续用默认单核\n");
+  }
 
   // 3. 问一下模型有几个输入输出
   rknn_input_output_num io_num;
@@ -161,6 +175,25 @@ RknnDetector::RknnDetector(const std::string& model_path, int imgsz, double conf
     impl_->n_cls = rows_scores;
   }
 
+  // 查每路输出的量化参数：2.5.0 默认输出 int8，得自己反量化
+  for (int i = 0; i < impl_->n_output && i < 2; ++i) {
+    rknn_tensor_attr a;
+    std::memset(&a, 0, sizeof(a));
+    a.index = i;
+    if (rknn_query(impl_->ctx, RKNN_QUERY_OUTPUT_ATTR, &a, sizeof(a)) == RKNN_SUCC) {
+      if (a.type == RKNN_TENSOR_INT8 && a.qnt_type == RKNN_TENSOR_QNT_AFFINE_ASYMMETRIC) {
+        impl_->out_quant[i] = true;
+        impl_->out_scale[i] = a.scale;
+        impl_->out_zp[i] = a.zp;
+        std::printf("输出[%d] int8: scale=%.6f zp=%d fmt=%d w_stride=%u n_elems=%u size=%u dims=[%d,%d,%d,%d]\n", i,
+                    static_cast<double>(a.scale), a.zp, static_cast<int>(a.fmt), a.w_stride,
+                    a.n_elems, a.size, a.dims[0], a.dims[1], a.dims[2], a.dims[3]);
+      } else {
+        std::printf("输出[%d] 是浮点（直接用）\n", i);
+      }
+    }
+  }
+
   impl_->n_cols = cols > 0 ? cols : 8400;
   std::printf("按 %s 解析: 类别 %d 个, 候选框 %d 个\n",
               impl_->n_output == 1 ? "单输出 [4+C, N]" : "双输出 boxes/scores", impl_->n_cls,
@@ -185,21 +218,39 @@ std::vector<Detection> RknnDetector::detect(const cv::Mat& frame) {
   cv::Mat canvas(imgsz_, imgsz_, CV_8UC3, cv::Scalar(114, 114, 114));
   resized.copyTo(canvas(cv::Rect(dx, dy, nw, nh)));
 
-  // blobFromImage 一次做完: 除以 255、BGR->RGB（倒数第二个参数 true）、排成 NCHW
-  cv::Mat blob = cv::dnn::blobFromImage(canvas, 1.0 / 255.0, cv::Size(imgsz_, imgsz_),
-                                        cv::Scalar(), true, false);
-
   // ===== 第 2 步: 喂进去、跑 =====
+  // 1.6.0 的运行库对 float32 输入处理有 bug 会段错误, 这里用 uint8 + NHWC,
+  // 也就是 RKNN 官方示例的标准做法: 传原始像素, 归一化和布局转换交给驱动做.
+  cv::Mat rgb;
+  cv::cvtColor(canvas, rgb, cv::COLOR_BGR2RGB);
+
   rknn_input inputs[1];
   std::memset(inputs, 0, sizeof(inputs));
   inputs[0].index = 0;
-  inputs[0].buf = blob.ptr<float>();
-  inputs[0].size = static_cast<uint32_t>(blob.total() * sizeof(float));
+  inputs[0].buf = rgb.data;
+  inputs[0].size = static_cast<uint32_t>(rgb.total() * rgb.elemSize());
   inputs[0].pass_through = 0;                  // 0 = 让驱动按下面两项做格式转换
-  inputs[0].type = RKNN_TENSOR_FLOAT32;        // 模型要 float32, 0~1
-  inputs[0].fmt = RKNN_TENSOR_NCHW;            // 和 NPU 内部布局一致, 免一次转换
+  inputs[0].type = RKNN_TENSOR_UINT8;          // 原始像素, 0~255
+  inputs[0].fmt = RKNN_TENSOR_NHWC;            // 高-宽-通道, 跟内存里的排法一致
+  const auto t_in0 = std::chrono::steady_clock::now();
   check(rknn_inputs_set(impl_->ctx, 1, inputs), "rknn_inputs_set");
+  const auto t_in1 = std::chrono::steady_clock::now();
+
+  // 分开量"数据搬运"和"NPU 计算"两段, 判断瓶颈到底在哪
+  const auto t_run0 = std::chrono::steady_clock::now();
   check(rknn_run(impl_->ctx, nullptr), "rknn_run");
+  const auto t_run1 = std::chrono::steady_clock::now();
+  {
+    static double sum_in = 0.0, sum_run = 0.0;
+    static int cnt = 0;
+    sum_in += std::chrono::duration<double, std::milli>(t_in1 - t_in0).count();
+    sum_run += std::chrono::duration<double, std::milli>(t_run1 - t_run0).count();
+    if (++cnt % 100 == 0) {
+      std::printf("[PERF] 喂数据 %.2f ms | NPU 计算 %.2f ms | 合计 %.2f ms（上限 %.1f fps）\n",
+                  sum_in / cnt, sum_run / cnt, (sum_in + sum_run) / cnt,
+                  1000.0 / ((sum_in + sum_run) / cnt));
+    }
+  }
 
   // ===== 第 3 步: 取输出(单输出取 1 个, 双输出取 2 个) =====
   const int n_out = impl_->n_output;
@@ -207,16 +258,30 @@ std::vector<Detection> RknnDetector::detect(const cv::Mat& frame) {
   for (int i = 0; i < n_out; ++i) {
     std::memset(&outputs[static_cast<size_t>(i)], 0, sizeof(rknn_output));
     outputs[static_cast<size_t>(i)].index = i;
-    outputs[static_cast<size_t>(i)].want_float = 1;    // 要 float, 省得自己反量化
+    // 交给驱动反量化(want_float=1)。实测这条路径对 int8 输出也是对的,
+    // 自己手工反量化反而会和驱动冲突。
+    outputs[static_cast<size_t>(i)].want_float = 1;
     outputs[static_cast<size_t>(i)].is_prealloc = 0;   // 让库自己分配, 用完调 release
   }
   check(rknn_outputs_get(impl_->ctx, n_out, outputs.data(), nullptr), "rknn_outputs_get");
 
   // 两种模型在这里归一成同一套读法: coord 前 4 行是 cx cy w h, score 是各类分数
+  // int8 输出先反量化到 float 缓冲, 后面的逻辑完全不感知量化
+  std::vector<float> coord_buf;
+  std::vector<float> score_buf;
+
+  auto dequant_into = [](const void* src, size_t n, float scale, int zp,
+                         std::vector<float>& dst) {
+    const auto* p = static_cast<const int8_t*>(src);
+    dst.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+      dst[i] = (static_cast<float>(p[i]) - static_cast<float>(zp)) * scale;
+    }
+  };
+
   const float* coord = nullptr;
   const float* score = nullptr;
   if (n_out == 1) {
-    // 单输出: 坐标和分数在同一个 buffer 里, 分数从第 4 行开始
     coord = static_cast<const float*>(outputs[0].buf);
     score = coord + static_cast<size_t>(4) * impl_->n_cols;
   } else {
@@ -258,6 +323,31 @@ std::vector<Detection> RknnDetector::detect(const cv::Mat& frame) {
   }
 
   rknn_outputs_release(impl_->ctx, n_out, outputs.data());
+
+  // 调试: 前 3 帧把"分数最高多少、过了阈值几个"打出来, 确认定位问题用, 稳定后可删
+  static int dbg_n = 0;
+  if (dbg_n < 3) {
+    ++dbg_n;
+    double mx = -1e9;
+    int over = 0;
+    for (int i = 0; i < n_cols; ++i) {
+      const double sc = static_cast<double>(score[i]);
+      if (sc > mx) mx = sc;
+      if (sc >= conf_) ++over;
+    }
+    std::printf("[DBG] n_cols=%d n_cls=%d conf=%.3f 分数最高=%.3f 过阈值=%d 保留=%zu\n", n_cols,
+                n_cls, conf_, mx, over, boxes.size());
+    for (int k = 0; k < 3 && k < static_cast<int>(boxes.size()); ++k) {
+      std::printf("[DBG]   box%d 原图坐标 x1=%.1f y1=%.1f x2=%.1f y2=%.1f score=%.3f\n", k,
+                  boxes[k].x1, boxes[k].y1, boxes[k].x2, boxes[k].y2, boxes[k].score);
+    }
+    for (int k = 0; k < 3 && k < static_cast<int>(boxes.size()); ++k) {
+      const size_t idx = static_cast<size_t>(k);
+      std::printf("[DBG]   原始 cx=%.1f cy=%.1f w=%.1f h=%.1f\n", coord[idx],
+                  coord[(size_t)n_cols + idx], coord[(size_t)2 * n_cols + idx],
+                  coord[(size_t)3 * n_cols + idx]);
+    }
+  }
 
   // ===== 第 5 步: NMS, 和 ONNX 版一字不差 =====
   std::sort(boxes.begin(), boxes.end(),

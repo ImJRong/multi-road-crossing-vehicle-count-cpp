@@ -152,6 +152,62 @@ void WebServer::push_frame(const cv::Mat& frame) {
   frame_cv_.notify_all();
 }
 
+void WebServer::sample_sys() {
+  // CPU：读 /proc/stat 第一行，用两次采样的差值算占用率
+  std::ifstream f("/proc/stat");
+  if (f) {
+    std::string tag;
+    unsigned long long user = 0, nice = 0, sys = 0, idle = 0;
+    unsigned long long iowait = 0, irq = 0, softirq = 0, steal = 0;
+    f >> tag >> user >> nice >> sys >> idle >> iowait >> irq >> softirq >> steal;
+    const unsigned long long total = user + nice + sys + idle + iowait + irq + softirq + steal;
+    const unsigned long long idle_all = idle + iowait;
+    if (last_cpu_total_ && total > last_cpu_total_) {
+      const double dt = static_cast<double>(total - last_cpu_total_);
+      const double di = static_cast<double>(idle_all - last_cpu_idle_);
+      cpu_usage_ = 100.0 * (1.0 - di / dt);
+      if (cpu_usage_ < 0.0) cpu_usage_ = 0.0;
+      if (cpu_usage_ > 100.0) cpu_usage_ = 100.0;
+    }
+    last_cpu_total_ = total;
+    last_cpu_idle_ = idle_all;
+  }
+
+  // 温度（毫摄氏度 -> 摄氏度）
+  {
+    std::ifstream tf("/sys/class/thermal/thermal_zone0/temp");
+    long milli = 0;
+    if (tf >> milli) temp_c_ = milli / 1000.0;
+  }
+
+  // NPU / GPU 当前频率（Hz -> MHz）
+  auto read_mhz = [](const char* path) -> int {
+    std::ifstream f(path);
+    long hz = 0;
+    if (f >> hz) return static_cast<int>(hz / 1000000);
+    return 0;
+  };
+  npu_mhz_ = read_mhz("/sys/class/devfreq/fdab0000.npu/cur_freq");
+  gpu_mhz_ = read_mhz("/sys/class/devfreq/fb000000.gpu/cur_freq");
+
+  // NPU 三核负载（格式: NPU load:  Core0: 46%, Core1:  8%, Core2:  8%,）
+  // 需要 /sys/kernel/debug 对普通用户可读，否则读失败就保持 0
+  {
+    std::ifstream nf("/sys/kernel/debug/rknpu/load");
+    std::string line;
+    if (std::getline(nf, line)) {
+      auto pick = [&line](const char* key) -> int {
+        const char* p = std::strstr(line.c_str(), key);
+        if (!p) return 0;
+        return std::atoi(p + std::strlen(key));
+      };
+      npu_c0_ = pick("Core0:");
+      npu_c1_ = pick("Core1:");
+      npu_c2_ = pick("Core2:");
+    }
+  }
+}
+
 void WebServer::update_stats(const std::vector<LineStat>& lines, int tracks, double fps,
                              double infer_ms, int frame_no) {
   std::ostringstream os;
@@ -266,8 +322,26 @@ void WebServer::route(int fd, const std::string& /*method*/, const std::string& 
   } else if (path == "/api/state") {
     std::string body;
     {
-      std::lock_guard<std::mutex> lk(stat_mu_);
-      body = state_json_;
+      // 每次请求都重新采样，这样暂停时 CPU/温度/频率仍在刷新
+      sample_sys();
+      std::string j;
+      {
+        std::lock_guard<std::mutex> lk(stat_mu_);
+        j = state_json_;
+      }
+      std::ostringstream sys;
+      sys.precision(2);
+      sys << std::fixed;
+      sys << "\"cpu\":" << cpu_usage_ << ",\"temp\":" << temp_c_
+          << ",\"npu\":" << npu_mhz_ << ",\"gpu\":" << gpu_mhz_
+          << ",\"npu_load\":[" << npu_c0_ << "," << npu_c1_ << "," << npu_c2_ << "]";
+      if (j.size() > 2 && j.back() == '}') {
+        // 在最后一个 } 前插入
+        j.insert(j.size() - 1, "," + sys.str());
+      } else {
+        j = "{" + sys.str() + "}";
+      }
+      body = j;
     }
     serve_json(fd, body);
   } else if (path == "/api/configs") {

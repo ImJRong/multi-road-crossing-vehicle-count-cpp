@@ -40,7 +40,7 @@ enum class TrackState {
 // 一条轨迹的完整状态（内部用，不对外）
 struct Track {
   long long id = 0;                   // 编号，从 1 开始只增不减
-  cv::Rect2f box;                     // 最后一次看到它的位置
+  cv::Rect2f box;                     // 最后一次看到它的位置（原始检测框）
   cv::Point2f origin;                 // 第一次出现时的中心，用来判断"它到底动没动"
   int lost = 0;                       // 连续几帧没匹配上，超过 track_buffer 就删
   double score = 0;                   // 最后一次匹配到的检测分数
@@ -52,7 +52,7 @@ struct Track {
 
 // 位移小于这个值就当静止目标：红绿灯、路牌、被风吹的广告牌。
 // 这类东西不计数也不画框。不能设太大，否则刚进画面的慢车会来不及计数。
-const double kMinTravel = 4.0;
+const double kMinTravel = 35.0;
 
 // 工具函数
 cv::Point2f center_of(const cv::Rect2f& b);                 // 框的中心点
@@ -76,6 +76,15 @@ class Tracker {
 
   // 当前有多少条轨迹活着（只用于打印统计）
   size_t size() const { return tracks_.size(); }
+
+  // 现在还活着的轨迹编号（含 Lost 缓冲期里的）.
+  // 给 Counter::retain 用: 不在这份名单里的车, 计数器那边就不用再记着它了.
+  std::vector<long long> live_ids() const {
+    std::vector<long long> ids;
+    ids.reserve(tracks_.size());
+    for (const auto& t : tracks_) ids.push_back(t.id);
+    return ids;
+  }
 
   // 累计分配过多少个编号（用来判断是不是在疯狂断号）
   long long total_ids() const { return next_id_ - 1; }
