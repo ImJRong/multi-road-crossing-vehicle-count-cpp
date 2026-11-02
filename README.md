@@ -10,25 +10,61 @@
 | 跟踪 | ultralytics 内置 ByteTrack | 自实现：卡尔曼预测 + 匈牙利分配 + 两阶段关联（代价 1-IoU，阈值 0.8 / 0.5） |
 | 用途 | 调参、验证算法、出报告数据 | 板子上跑 |
 
-> 更细的部署记录（踩过的坑、每天改了什么、现在卡在哪）在 Python 版的 `MEMORY.md` 里。
+## 先看哪一节
+
+本仓库（C++ 版）：https://github.com/ImJRong/multi-road-crossing-vehicle-count-cpp
+Python 版：https://github.com/ImJRong/multi-road-crossing-vehicle-count
+
+| 目的 | 去哪 |
+|---|---|
+| 编译、跑起来 | 本文 §三、§四 |
+| 改配置（ROI、计数线、阈值） | 本文 §五 |
+| 转模型 / 换模型 | 本文 §六、§七 |
+| 批量评测模型、看性能数字 | 本文 §七点五、§七点六 |
+| 懂原理（为什么这样设计） | 本文 §八~§十一 |
+| 完整踩坑记录、交接文档 | [Python 版 MEMORY.md](https://github.com/ImJRong/multi-road-crossing-vehicle-count/blob/main/MEMORY.md) |
+| **框偏移的原理推导（带 11 张图）** | [docs/head4_原理详解.md](https://github.com/ImJRong/multi-road-crossing-vehicle-count/blob/main/docs/head4_%E5%8E%9F%E7%90%86%E8%AF%A6%E8%A7%A3.md) |
+| Python 版全部工具脚本 | [tools/README.md](https://github.com/ImJRong/multi-road-crossing-vehicle-count/blob/main/tools/README.md) |
+
+> 跨仓库的链接必须写完整 URL，相对路径只在本仓库内有效。
 
 ---
 
-## 一、现在是什么状态（2026-11-01）
-
-### 板子上跑通了
+## 一、现在是什么状态（2026-11-02）
 
 | 项 | 状态 |
 |---|---|
-| RKNN 推理（INT8） | ✅ 跑通，`output: none` 时 20.6 fps |
-| 网页实时显示 | ✅ MJPEG 推流，浏览器能看 |
+| RKNN 推理（INT8） | ✅ 18.3 fps |
+| **框定位精度** | ✅ **中心偏移 0.03 px（原 6.75 px）** |
+| 网页实时显示 | ✅ MJPEG 推流 |
 | 跟踪 + 过线计数 | ✅ 能跑 |
 | 参数实时调整 | ✅ 网页改 conf/iou 立即生效 |
 | 系统状态显示 | ✅ CPU / 温度 / NPU 频率 / 三核负载 |
 
-### 主要问题
+### 框偏移已解决（2026-11-02）
 
-**计数漏**：转弯车经常漏计，直行车正常。还没解决，怀疑在 `counter.cpp` 的 `near_segment`（车从线段端点外侧绕过去就判不到）或 `count_dir`（只数一个方向）。详见 Python 版 `MEMORY.md` 第六节。
+板端框原先整体偏左上 6~22 px，车越小偏得越多。现已修复，**速度不变**。
+
+**原因**：RKNN 按 `范围/256` 分配量化刻度。原模型输出坐标（0~640），刻度 2.5；
+而 DFL 内部的距离只有 0~15，被粗刻度压没了精度。
+
+**解法**：模型输出改为「DFL 距离 0~15」，坐标换算移到 `rknn_detector.cpp` 用 float 完成。
+距离成为独立输出后，RKNN 按其真实范围分配刻度 0.047，**精细 53 倍**。
+
+模型权重一个字节未改，量化方式未改，速度未变。
+
+> 完整原理（量化机制推导、11 张图）见 Python 版仓库 `docs/head4_原理详解.md`。
+
+### 计数漏（已收尾）
+
+转弯车曾经常漏计。实测定量结果：改用 head4 后**断号减少 34.3%**
+（12135 帧，2559 → 1680 个轨迹编号），计数净增 12，无一条线下降。
+
+即框偏移导致的框抖，是漏计的一个成因，但只解释了约三分之一。
+剩余成因未进一步查证，投入产出比不高，暂告一段落。
+
+> **注意**：`count_dir` 只数一个方向**不是缺陷**——这几个路口都是单行道，
+> 单方向计数是设计意图。详见 Python 版 `MEMORY.md` 6.1。
 
 ### 硬件与环境
 
@@ -191,17 +227,37 @@ done
 
 ## 六、模型转换（转不出来先看这节）
 
-### 唯一验证通过的配方
+### 唯一验证通过的配方（head4，2026-11-02）
 
 | 项 | 值 |
 |---|---|
-| 工具 | **rknn-toolkit2 1.6.0+81f21f4d**（不是 2.5.0） |
-| 输入 ONNX | `best_detrac_head3.onnx`（**删掉了末端 Concat**） |
-| ONNX 输出名 | `/model.22/Mul_2_output_0`（boxes `[1,4,8400]`）+ `/model.22/Sigmoid_output_0`（scores `[1,1,8400]`） |
+| 工具 | **rknn-toolkit2 1.6.0+81f21f4d**（不要用 2.5.0，见下文） |
+| 输入 ONNX | `best_detrac_head4.onnx`（删掉末端 Concat + DFL 之后的 9 个换算节点） |
+| ONNX 输出名 | `/model.22/dfl/Reshape_1_output_0`（**距离** `[1,4,8400]`）+ `/model.22/Sigmoid_output_0`（分数 `[1,1,8400]`） |
 | config | `target_platform='rk3588'`、`mean_values=[[0,0,0]]`、`std_values=[[255,255,255]]` |
 | build | `do_quantization=True`，其余全默认（w8a8 / normal / optimization_level 默认 1） |
 | 校准集 | 300 张，每个视频各 75 张 |
-| 产出 | `models/best_detrac_v7.rknn`，**6,482,288 字节** |
+| 产出 | `models/best_detrac_v12_head4.rknn`，**5,969,848 字节** |
+| 关键指标 | 距离输出的 `scale = 0.046943`（旧模型是 2.5017） |
+
+**为什么输出距离而不是坐标**：RKNN 按 `范围/256` 分配刻度。
+输出坐标（0~640）→ 刻度 2.5；输出距离（0~15）→ 刻度 0.047，**精细 53 倍**。
+
+坐标换算（`anchor ± 距离`，再乘 stride）移到 `rknn_detector.cpp` 用 float 完成。
+
+> 详细推导见 Python 版仓库 `docs/head4_原理详解.md`。
+
+### ★ 换模型不用改代码
+
+`rknn_detector.cpp` 按输出张量名是否含 `"dfl"` 自动识别模型类型：
+
+```cpp
+// head4: /model.22/dfl/Reshape_1_output_0  -> 含 "dfl"，走距离换算
+// head3: /model.22/Mul_2_output_0          -> 不含，直接用坐标
+impl_->boxes_is_dist = std::string(a.name).find("dfl") != std::string::npos;
+```
+
+因此 `best_detrac.rknn` 换成 head3 或 head4 都能直接跑，无需重新编译。
 
 ### ★ 为什么不能用 Split 拆输出头
 
@@ -211,41 +267,45 @@ done
 
 | 拆法 | 图结构 | 结果 |
 |---|---|---|
-| ❌ 在 Concat **后面**加 Split | `Concat_3 → output0 → Split → boxes/scores` | 1.6.0：scores 的 8400 个 int8 全是 `-128`（= zp = 0.0）；2.5.0：分数正常但框塌（float 均值 330 vs 正常的 182） |
+| ❌ 在 Concat **后面**加 Split | `Concat_3 → output0 → Split → boxes/scores` | 1.6.0：scores 的 8400 个 int8 全是 `-128`（= zp = 0.0）；2.5.0：分数正常但框塌 |
 | ✅ **删掉** Concat | `Mul_2 → boxes`、`Sigmoid → scores` 直接当输出 | 1.6.0 转出来正常 |
 
 原因：RKNN 编译器会把挂在输出上的 Split 融合掉，两个版本各有各的融错法。删掉 Concat 就没有可融的东西。
-
-**正确做法**（`tools/make_head3.py`）：
-
-```python
-m.graph.node.remove(concat)          # concat.name = '/model.22/Concat_3'
-del m.graph.output[:]
-m.graph.output.extend([
-    helper.make_tensor_value_info(boxes,  TensorProto.FLOAT, [1, 4, 8400]),
-    helper.make_tensor_value_info(scores, TensorProto.FLOAT, [1, 1, 8400]),
-])
-```
 
 脚本自带校验：把两路输出拼回去和原模型 `output0` 逐元素比，最大差值必须是 0。
 
 ### 复现
 
 ```bash
-# WSL
+# Windows 侧：生成 ONNX（每步都带校验）
+D:\Python3.12.4\python.exe tools\01_convert\make_head3.py
+D:\Python3.12.4\python.exe tools\01_convert\make_head4.py
+D:\Python3.12.4\python.exe tools\01_convert\verify_head4_decode.py   # 必须看到差值 0
+
+# WSL 侧：转 RKNN
 conda activate rknn16
-python <Python版仓库>/tools/make_head3.py     # 生成+校验 ONNX
-python <Python版仓库>/tools/convert_head3.py  # 转 rknn
+cd ~/traffic_count
+python /mnt/d/multi-road-crossing-vehicle-count/tools/01_convert/convert_head4_probe.py
 ```
+
+### ★ 为什么不能用 rknn-toolkit2 2.5.0
+
+同一份 ONNX、同一批校准图、同一套 config，只换工具版本：
+
+| 工具 | 结果 |
+|---|---|
+| 1.6.0 | 框正常 |
+| 2.5.0 | **w/h 被放大 13 倍**，通道最大值顶到 637.92（= 255 × 2.5） |
+
+2.5.0 的 `auto_hybrid`（自动混合量化）开关本身正常，但救不了这个缺陷。
+详见 Python 版 `MEMORY.md` 5.8 节。
 
 ### 试过但没用的（别再重复）
 
 - `quantized_dtype`、`hybrid_level`、`custom_string`、`quantized_input_type` —— 都是猜的，无效
 - `mmse` / `kl_divergence` —— 只是换裁剪范围，1 像素级收益；mmse 还容易 OOM
-- 2.5.0 的 `disable_rules=['seperate_conv_rs_split']` —— 只对 2.5.0，1.6.0 没这个参数
 - `optimization_level=3` —— 把 DFL 的归一化融没了，坐标算出天文数字（`cx = -2.18e33`）
-
-想再提精度，按这个顺序：更好的校准集 → 混合量化（部分层 fp16）→ 直接上 fp16 模型 → QAT。
+- 各种混合量化方案 —— 两个工具版本都不通
 
 ---
 
@@ -263,15 +323,189 @@ make rknn_probe                                            # 只编它，几秒�
 
 ### 合格标准（第 200 帧，test1）
 
+**head4（当前）**
+
+| 输出 | 合格表现 |
+|---|---|
+| 距离 float | min ≈0、max ≈11、**均值 ≈2.4** |
+| 距离 scale | **0.046943**（这是方案成立的关键指标） |
+| scores int8 | 8400 个里约 **60 个非零、9 个 >0.5** |
+
+**head3（对照）**
+
 | 输出 | 合格表现 |
 |---|---|
 | boxes float | min 0、max ≈630、**均值 ≈182**（塌了会变成 330 左右） |
-| scores int8 原始值 | 8400 个里约 **60 个非零、9 个 >0.5** |
+| boxes scale | 2.501652 |
 | scores float | max ≈0.78~0.80 |
 
 **一眼判据**：看 `[OUT1 int8]` 那行的 `==zp(-128)`——**8340 左右 = 好；8400 = 全 0，模型坏了**。
 
 （8400 个候选框里绝大部分本来就是背景，所以"几乎全是 -128"是正常的。）
+
+**判断 4 个通道有没有坏**，用 `tools/02_diagnose/ch_scan.cpp`：
+
+```
+正常: ch0 0~630 | ch1 0~615 | ch2 2.5~510 | ch3 2.5~230   （四路各不相同）
+坏了: 四路全是 0~638                                        （= 255 × 2.5，被截断）
+```
+
+---
+
+## 七点五、批量评测：multi_eval
+
+`rknn_probe` 只看一帧，`multi_eval` 跑完整视频并给出计数统计，用来量化比较两个模型的差别。
+
+**和 `traffic_count` 的区别**：不画框、不存视频、可多路并行，所以快得多。
+单路 18~22 fps，四路并行合计 **62~73 fps**。
+
+```bash
+cd ~/code
+make multi_eval
+
+# 四路并行，各跑前 3600 帧（视频更短的跑完即止）
+./multi_eval configs/test1.json configs/test2.json configs/test3.json configs/test4.json \
+    --frames 3600 --out output/full_head4
+
+# 换模型对比同一批数据
+./multi_eval configs/test1.json configs/test2.json configs/test3.json configs/test4.json \
+    --frames 3600 --model models/best_detrac_v7.rknn --out output/full_v7
+```
+
+参数：
+
+| 参数 | 作用 |
+|---|---|
+| `--frames N` | 每路最多跑 N 帧，0 或不写 = 全部 |
+| `--model path` | 指定 `.rknn` 模型，默认 `models/best_detrac.rknn` |
+| `--out prefix` | 结果写到 `<prefix>_summary.csv` |
+
+实现要点：每个线程创建独立的 `RknnDetector`，按 `i % 3` 绑定到 0/1/2 号 NPU 核
+（`RknnDetector::set_core()`），因此四路线程能真正分散到三个核上并行。
+
+结果 CSV 用 `tools/02_diagnose/compare_models.py` 对比，输出断号数和各线计数。
+
+### 2026-11-02 实测结果
+
+完整视频（12135 帧），v7 与 head4 同配置对比：
+
+| 视频 | 帧数 | v7 编号数 | head4 编号数 | 降幅 |
+|---|---|---|---|---|
+| test1 | 3600 | 553 | **450** | 18.6% |
+| test2 | 3600 | 625 | **441** | 29.4% |
+| test3 | 2535 | 909 | **539** | 40.7% |
+| test4 | 2400 | 472 | **250** | 47.0% |
+| **合计** | 12135 | **2559** | **1680** | **34.3%** |
+
+编号数是 `Tracker::total_ids()`，即累计分配过多少轨迹编号。
+同一视频同样帧数下，编号越少说明断号越少（一辆车被反复换号）。
+
+计数变化净增 **+12**，无一条线下降。
+
+**结论**：框偏移修复让断号减少约三分之一，这部分漏计随之解决；
+剩余漏计另有成因（见第四节「计数漏」）。
+
+---
+
+## 七点六、性能实测：pipeline_bench
+
+单视频流水线：**并行推理 + 串行跟踪**。三段之间用队列连接，帧号作钥匙。
+
+```
+读帧线程 ──→ 队列 ──→ K 个推理线程 ──→ 队列 ──→ 跟踪线程
+                       (各绑一个 NPU 核)          (单线程串行)
+```
+
+```bash
+cd ~/code
+make pipeline_bench
+./pipeline_bench configs/test1.json --workers 10 --frames 900
+```
+
+| 参数 | 作用 |
+|---|---|
+| `--workers N` | 推理线程数（默认 3） |
+| `--frames N` | 最多跑多少帧（0 = 全部） |
+| `--buf N` | 读帧队列上限（默认 32）。批处理设大，实时流设小 |
+| `--realtime N` | **按 N fps 节奏送帧，模拟实时摄像头**（默认 0 = 尽快读） |
+| `--no-track` | 只检测不跟踪，用于测跟踪开销 |
+| `--model path` | 换模型 |
+
+### 单视频吞吐
+
+| 线程数 | 吞吐 | 相对单线程 |
+|---|---|---|
+| 1 | 18.4 fps | 1.00× |
+| 3 | 65.9 fps | 3.58× |
+| 6 | 105.5 fps | 5.73× |
+| **10** | **118~121 fps** | **6.6×** |
+| 16 | 120.1 fps | 6.53× |
+
+**拐点在 10 线程**，之后不再上升（3 个核已吃满）。
+
+### 延迟要拆开看
+
+| 线程数 | 纯推理 | 排队等待 | 端到端 |
+|---|---|---|---|
+| 1 | 52.5 ms | 1670 ms | 1725 ms |
+| 3 | 49.8 ms | 501 ms | 553 ms |
+| 10 | 118.7 ms | 296 ms | 418 ms |
+
+**端到端那 1.7 秒里，1.67 秒是在队列排队，真正算一帧只要 52ms。**
+排队时间 ≈ 队列长度 × 单帧耗时（32 × 52ms = 1.66 秒，与实测吻合）。
+
+### 模拟实时摄像头（`--realtime`）
+
+判据看**队列占用率**：送帧速度受节奏限制，吞吐必然约等于送帧速度，
+真正能看出「跟不跟得上」的是队列有没有堆起来。
+
+| 送帧速度 | 1 线程 | 3 线程 | 6 线程 | 8 线程 |
+|---|---|---|---|---|
+| 15 fps | ✅ 65ms | ✅ 62ms | — | — |
+| 30 fps | ❌ 队列 100% | ✅ **47ms** | — | — |
+| 60 fps | ❌ | ✅ 47ms | — | — |
+| 90 fps | ❌ | ❌ | ✅ 62ms | ✅ 68ms |
+| 120 fps | ❌ | ❌ | — | ✅ 146ms |
+
+**接摄像头必须开多线程**：单线程只能扛 15fps（单核推理上限 20fps），
+**3 线程可扛 60fps，延迟仅 47ms**。
+
+### 跟踪占用多少
+
+| 线程数 | 只检测 | 检测+跟踪 |
+|---|---|---|
+| 3 | 70.7 fps | 66.7 fps |
+| 10 | 117.4 fps | 116.9 fps |
+
+**跟踪几乎不占时间**（约 2~3ms/帧，被 NPU 的时间掩盖），
+所以不需要「先全部推理完再批量跟踪」，边跑边追没有额外成本。
+
+### 硬件上限
+
+```
+单帧推理（单核）: 42~52 ms  →  单核 20~24 fps
+三核理论极限:     约 72 fps（无竞争）
+流水线实测峰值:   120 fps（靠队列深度掩盖延迟）
+```
+
+**120 fps 已接近这块板子的物理上限。**
+
+### 场景建议
+
+| 场景 | 命令 | 预期 |
+|---|---|---|
+| 批量跑多个 mp4 | `multi_eval` 四路并行 | 71 fps |
+| 单个 mp4 要快 | `pipeline_bench --workers 10 --buf 64` | 118 fps |
+| 接 30fps 摄像头 | `--workers 3 --buf 30 --realtime 30` | 47ms 延迟 |
+| 接 60fps 摄像头 | `--workers 3 --buf 30 --realtime 60` | 47ms，队列 10% |
+
+### GPU 说明
+
+板子有 **Mali-G610 MP4**（最高 1.0 GHz，`/dev/mali*`、`g18p0` 驱动都在），
+但**当前项目没用它**：推理在 NPU，跟踪/计数/画图在 CPU。
+
+唯一值得用的地方是存视频时调硬件编码器（rkmpp）省 CPU。
+**不能用来训练** —— Mali 没有可用的 PyTorch 后端，且 6GB 共享内存、25GB/s 带宽不够。
 
 ---
 
@@ -440,8 +674,8 @@ make rknn_probe                                            # 只编它，几秒�
 
 ## 十三、已知问题
 
-1. **计数漏（主要矛盾）**：转弯车经常漏计。可疑点见 `counter.cpp` 的 `near_segment` 和 `count_dir`
-2. **框轻微向左上偏 1~2 px**：INT8 量化固有（步长 2.5 px），换 FP16 能解决但慢一倍
+1. **计数漏（已收尾）**：断号减少 34.3%，计数净增 12。剩余成因未查证。详见 `MEMORY.md` 6.1
+2. ~~**框轻微向左上偏 1~2 px**~~ —— **已解决**：head4 把中心偏移降到 0.03 px，见第六节
 3. **框轻微抖动**：INT8 量化噪声 + 卡尔曼。已删掉多余的 EMA（2026-11-01），只保留卡尔曼一层平滑
 4. **端口被占时仍打印「服务已启动」**：`main.cpp` 无条件打印，`web_server.cpp` 其实已经报错了
 5. **网页参数只存内存**，不写回 json，重启即恢复
@@ -450,9 +684,8 @@ make rknn_probe                                            # 只编它，几秒�
 
 ## 十四、还没做
 
-- 计数漏的修复（当前最优先）
 - 交叉编译到 aarch64（现在是在板子上直接编）
-- 多路并行 + 分屏
+- 多路并行 + 分屏（`multi_eval` 已验证四路并行，但那是纯评测，不出画面）
 - RTSP 实时流（现在只吃 mp4）
 - 事件和计数落库（现在只在内存留 200 条）
 - 人工真值全覆盖（目前只有 test3 的 B 线）

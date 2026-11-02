@@ -1,28 +1,28 @@
-// RKNN 推理实现（板子用）. 逻辑和 detector.cpp 一一对应, 只把四个调用换掉:
+// RKNN 推理实现（板端）。流程与 detector.cpp 一致，仅替换以下四个调用：
 //
 //   Ort::Session   加载模型   ->  rknn_init
-//   CreateTensor   喂输入     ->  rknn_inputs_set
-//   session_.Run   跑          ->  rknn_run
-//   GetTensorData  取输出     ->  rknn_outputs_get
+//   CreateTensor   提交输入   ->  rknn_inputs_set
+//   session_.Run   执行推理   ->  rknn_run
+//   GetTensorData  读取输出   ->  rknn_outputs_get
 //
-// 前处理和后处理与 ONNX 版完全相同, 因为它们跟推理后端无关.
+// 前处理与后处理与 ONNX 版相同，这两部分与推理后端无关。
 //
-// 一个必须知道的差异: 数据布局
-//   ONNX Runtime 吃 NCHW（先通道、再高、再宽）
-//   RKNN 内部也是 NCHW（rknn_api.h 里写明 "internal input format of NPU is NCHW by default"）
-//   所以这里也传 NCHW, 免掉驱动再做一次转换.
+// 数据布局差异：
+//   ONNX Runtime 使用 NCHW（通道、高、宽）
+//   RKNN 内部同样为 NCHW（见 rknn_api.h："internal input format of NPU is NCHW by default"）
+//   因此此处直接传入 NCHW，避免驱动侧额外转换。
 //
-// 两种模型, 一份代码:
-//   单输出 [1, 5, 8400]              —— 坐标和分数拼在一起, FP16 模型就是这个
-//   双输出 [1,4,8400] + [1,1,8400]   —— 拆开的 boxes / scores, INT8 模型必须是这个
+// 支持两种输出结构：
+//   单输出 [1, 5, 8400]              —— 坐标与分数拼接，FP16 模型采用此结构
+//   双输出 [1,4,8400] + [1,1,8400]   —— 分离的 boxes / scores，INT8 模型采用此结构
 //
-// 为什么 INT8 要拆:
-//   量化把一个张量整体映射到 8 位整数, 一套 scale 管所有数. 坐标是 0~640, 分数是 0~1,
-//   共用 2.5 的步长时, 0.87 会被舍成 0 —— 分数全灭, 一个框都出不来.
-//   拆开后 boxes 用 2.5 的步长, scores 用 1/255 的步长, 各管各的, 分数就保住了.
+// INT8 必须拆分的依据：
+//   量化将整个张量映射到 8 位整数，同一张量共用一套 scale。坐标值域 0~640，分数值域 0~1，
+//   若共用步长 2.5，则 0.87 会被舍入为 0，导致分数全部失效、无法检出目标。
+//   拆分后 boxes 使用步长 2.5，scores 使用 1/255，各自独立，分数得以保留。
 //
-// 这里的做法: 两个输出各自读, 但后面的过滤和 NMS 完全走同一条路,
-// 所以单输出模型和双输出模型的结果是一致可比的.
+// 两个输出分别读取，后续过滤与 NMS 走同一条路径，
+// 因此单输出与双输出模型的结果可直接比较。
 
 #include "rknn_detector.hpp"
 
@@ -57,7 +57,7 @@ void check(int ret, const char* what) {
   }
 }
 
-// 打印一个 tensor 的 dims, 排查问题时最常看的就是这行
+// 打印张量维度，排查问题时的主要依据
 void print_dims(const char* tag, const rknn_tensor_attr& a) {
   std::printf("%s dims=[", tag);
   for (uint32_t i = 0; i < a.n_dims; ++i) {
@@ -79,8 +79,20 @@ struct RknnDetector::Impl {
   int n_cols = 8400;                  // 候选框个数
   int n_cls = 1;                      // 类别数
 
-  // 输出张量是不是 int8 量化。老模型(1.6.0 转的)输出 float32，这里是 false；
-  // 新模型(2.5.0)输出 int8，要按 (q - zp) * scale 自己反量化。
+  // head4 模型输出 DFL 距离而非坐标，需在此换算：
+  //   head3：输出 cx cy w h，单位为 640 空间像素
+  //   head4：输出 l t r b 四个距离，单位为 anchor 网格数，值域 0~15
+  // 换算依据：head3 的 boxes 张量 scale=2.5017（每步进 2.5 像素），
+  //           head4 的距离张量 scale=0.0469（每步进 0.047），量化精度提升约 53 倍。
+  // 识别方式：依据坐标输出的张量名中是否含 "dfl"
+  //   head4 为 /model.22/dfl/Reshape_1_output_0，head3 为 /model.22/Mul_2_output_0
+  bool boxes_is_dist = false;
+  std::vector<float> anchor_x;        // 8400 个 anchor 网格中心 x 坐标
+  std::vector<float> anchor_y;        // 8400 个 anchor 网格中心 y 坐标
+  std::vector<float> stride_tab;      // 8400 个 stride，按 8 / 16 / 32 分三段
+
+  // 输出张量的量化属性。float32 输出时 out_quant 为 false；
+  // int8 输出需按 (q - zp) * scale 反量化后方可使用。
   bool out_quant[2] = {false, false};
   float out_scale[2] = {1.f, 1.f};
   int out_zp[2] = {0, 0};
@@ -88,32 +100,33 @@ struct RknnDetector::Impl {
 
 RknnDetector::RknnDetector(const std::string& model_path, int imgsz, double conf, double iou)
     : impl_(new Impl()), imgsz_(imgsz), conf_(conf), iou_(iou) {
-  // 1. 把 .rknn 整个读进内存
+  // 1. 将 .rknn 文件完整读入内存
   std::ifstream f(model_path, std::ios::binary);
   if (!f) throw std::runtime_error("打不开模型: " + model_path);
   impl_->model.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
   if (impl_->model.empty()) throw std::runtime_error("模型文件是空的: " + model_path);
 
-  // 2. 初始化. 第三个参数是模型大小, 第四个 0 = 不加密
+  // 2. 初始化。参数三为模型大小，参数四为 0 表示不加密
   check(rknn_init(&impl_->ctx, impl_->model.data(),
                   static_cast<uint32_t>(impl_->model.size()), 0, nullptr),
         "rknn_init");
 
-  // RK3588 有 3 个 NPU 核, 默认只用一个。这里切到三核并行, 推理速度能上去一截。
+  // RK3588 含 3 个 NPU 核心，默认仅启用一个。此处切换为三核并行以提高推理吞吐。
+  // 若调用方稍后用 set_core() 指定单核，会覆盖这里的设置。
   if (rknn_set_core_mask(impl_->ctx, RKNN_NPU_CORE_0_1_2) == 0) {
     std::printf("NPU: 三核并行已开启\n");
   } else {
     std::printf("NPU: 三核设置失败, 继续用默认单核\n");
   }
 
-  // 3. 问一下模型有几个输入输出
+  // 3. 查询模型的输入输出数量
   rknn_input_output_num io_num;
   std::memset(&io_num, 0, sizeof(io_num));
   check(rknn_query(impl_->ctx, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num)),
         "rknn_query(IN_OUT_NUM)");
   std::printf("RKNN 模型: 输入 %u 个, 输出 %u 个\n", io_num.n_input, io_num.n_output);
 
-  // 4. 打印输入的形状, 出问题时第一个要看的就是这个
+  // 4. 打印输入形状
   rknn_tensor_attr in_attr;
   std::memset(&in_attr, 0, sizeof(in_attr));
   in_attr.index = 0;
@@ -123,12 +136,12 @@ RknnDetector::RknnDetector(const std::string& model_path, int imgsz, double conf
   std::printf("      fmt=%d type=%d\n", static_cast<int>(in_attr.fmt),
               static_cast<int>(in_attr.type));
 
-  // 5. 问输出的形状, 用它来定 n_rows / n_cols, 不写死
+  // 5. 查询输出形状，据此确定 n_rows / n_cols，不硬编码
   impl_->n_output = static_cast<int>(io_num.n_output);
   int cols = 0;
 
   if (impl_->n_output == 1) {
-    // ---- 单输出: [1, 5, 8400], 前 4 行坐标, 第 5 行起是分数 ----
+    // 单输出：[1, 5, 8400]，前 4 行为坐标，其后为各类分数
     rknn_tensor_attr a;
     std::memset(&a, 0, sizeof(a));
     a.index = 0;
@@ -142,8 +155,8 @@ RknnDetector::RknnDetector(const std::string& model_path, int imgsz, double conf
     impl_->n_cls = impl_->n_rows - 4;
     impl_->scores_index = -1;
   } else {
-    // ---- 双输出: 一个 [1, 4, 8400] 放坐标, 一个 [1, C, 8400] 放分数 ----
-    // 不靠输出顺序猜, 按"行数"认: 4 行的那个是坐标, 其余的是分数.
+    // 双输出：一个 [1, 4, 8400] 存坐标，一个 [1, C, 8400] 存分数
+    // 按行数而非输出顺序识别：4 行为坐标，其余为分数。
     int rows_boxes = 0;
     int rows_scores = 0;
     for (int i = 0; i < impl_->n_output; ++i) {
@@ -198,14 +211,81 @@ RknnDetector::RknnDetector(const std::string& model_path, int imgsz, double conf
   std::printf("按 %s 解析: 类别 %d 个, 候选框 %d 个\n",
               impl_->n_output == 1 ? "单输出 [4+C, N]" : "双输出 boxes/scores", impl_->n_cls,
               impl_->n_cols);
+
+  // ===== 认一下这是 head3 还是 head4，head4 要预先建好 anchor 表 =====
+  {
+    rknn_tensor_attr a;
+    std::memset(&a, 0, sizeof(a));
+    a.index = impl_->boxes_index;
+    if (rknn_query(impl_->ctx, RKNN_QUERY_OUTPUT_ATTR, &a, sizeof(a)) == RKNN_SUCC) {
+      // 张量名含 "dfl" 即为 head4（输出距离而非坐标）
+      impl_->boxes_is_dist = std::string(a.name).find("dfl") != std::string::npos;
+    }
+  }
+
+  if (impl_->boxes_is_dist) {
+    // 构建 anchor 网格表。三个 stride 层依次拼接：
+    //   80x80 = 6400 个，stride 8
+    //   40x40 = 1600 个，stride 16
+    //   20x20 =  400 个，stride 32
+    // 网格中心坐标 = (列号 + 0.5, 行号 + 0.5)，与 ONNX 图中的常量逐元素一致。
+    struct SegBlk { int n; int g; float stride; };
+    const SegBlk segs[3] = {{6400, 80, 8.f}, {1600, 40, 16.f}, {400, 20, 32.f}};
+    const int N = impl_->n_cols;
+    impl_->anchor_x.resize(static_cast<size_t>(N));
+    impl_->anchor_y.resize(static_cast<size_t>(N));
+    impl_->stride_tab.resize(static_cast<size_t>(N));
+    int i = 0;
+    for (const auto& s : segs) {
+      for (int k = 0; k < s.n && i < N; ++k, ++i) {
+        impl_->anchor_x[static_cast<size_t>(i)] = static_cast<float>(k % s.g) + 0.5f;
+        impl_->anchor_y[static_cast<size_t>(i)] = static_cast<float>(k / s.g) + 0.5f;
+        impl_->stride_tab[static_cast<size_t>(i)] = s.stride;
+      }
+    }
+    std::printf("模型类型: head4（输出 DFL 距离，坐标在 CPU 里换算）\n");
+    {
+      // 打印各段首尾，确认三个 stride 段的网格都生成对了
+      struct { const char* tag; int lo; } chk[3] = {{"seg1(80x80, s8) ", 0},
+                                                   {"seg2(40x40,s16) ", 6400},
+                                                   {"seg3(20x20,s32) ", 8000}};
+      for (const auto& c : chk) {
+        const size_t lo = static_cast<size_t>(c.lo);
+        const size_t hi = static_cast<size_t>(c.lo + (c.lo == 0 ? 6399 : (c.lo == 6400 ? 1599 : 399)));
+        std::printf("  %s 首(%.1f,%.1f) 尾(%.1f,%.1f) stride=%.0f\n", c.tag,
+                    impl_->anchor_x[lo], impl_->anchor_y[lo], impl_->anchor_x[hi],
+                    impl_->anchor_y[hi], impl_->stride_tab[lo]);
+      }
+    }
+  } else {
+    std::printf("模型类型: head3（输出已是 cx cy w h 坐标，直接用）\n");
+  }
 }
 
 RknnDetector::~RknnDetector() {
   if (impl_ && impl_->ctx) rknn_destroy(impl_->ctx);
 }
 
+void RknnDetector::set_core(int core_id) {
+  // RKNN_NPU_CORE_0 / _1 / _2 分别是 0x1 / 0x2 / 0x4；
+  // RKNN_NPU_CORE_AUTO (0x0) 表示交给驱动自动选择，等同于不绑定。
+  if (core_id < 0) {
+    if (rknn_set_core_mask(impl_->ctx, RKNN_NPU_CORE_AUTO) == 0) {
+      std::printf("NPU: 恢复自动选择核\n");
+    }
+    return;
+  }
+  const rknn_core_mask masks[3] = {RKNN_NPU_CORE_0, RKNN_NPU_CORE_1, RKNN_NPU_CORE_2};
+  const int idx = core_id % 3;
+  if (rknn_set_core_mask(impl_->ctx, masks[idx]) == 0) {
+    std::printf("NPU: 已绑定到核 %d\n", idx);
+  } else {
+    std::printf("NPU: 绑定核 %d 失败，继续使用默认设置\n", idx);
+  }
+}
+
 std::vector<Detection> RknnDetector::detect(const cv::Mat& frame) {
-  // ===== 第 1 步: letterbox, 和 ONNX 版一字不差 =====
+  // ===== 第 1 步：letterbox，与 ONNX 版完全一致 =====
   const double scale = std::min(imgsz_ / static_cast<double>(frame.cols),
                                 imgsz_ / static_cast<double>(frame.rows));
   const int nw = static_cast<int>(std::round(frame.cols * scale));
@@ -218,9 +298,9 @@ std::vector<Detection> RknnDetector::detect(const cv::Mat& frame) {
   cv::Mat canvas(imgsz_, imgsz_, CV_8UC3, cv::Scalar(114, 114, 114));
   resized.copyTo(canvas(cv::Rect(dx, dy, nw, nh)));
 
-  // ===== 第 2 步: 喂进去、跑 =====
-  // 1.6.0 的运行库对 float32 输入处理有 bug 会段错误, 这里用 uint8 + NHWC,
-  // 也就是 RKNN 官方示例的标准做法: 传原始像素, 归一化和布局转换交给驱动做.
+  // ===== 第 2 步：提交输入并执行推理 =====
+  // 1.6.0 运行库处理 float32 输入时会段错误，因此使用 uint8 + NHWC，
+  // 即 RKNN 官方示例的标准做法：传入原始像素，归一化与布局转换由驱动完成。
   cv::Mat rgb;
   cv::cvtColor(canvas, rgb, cv::COLOR_BGR2RGB);
 
@@ -236,7 +316,7 @@ std::vector<Detection> RknnDetector::detect(const cv::Mat& frame) {
   check(rknn_inputs_set(impl_->ctx, 1, inputs), "rknn_inputs_set");
   const auto t_in1 = std::chrono::steady_clock::now();
 
-  // 分开量"数据搬运"和"NPU 计算"两段, 判断瓶颈到底在哪
+  // 分别统计数据传输与 NPU 计算耗时，用于定位性能瓶颈
   const auto t_run0 = std::chrono::steady_clock::now();
   check(rknn_run(impl_->ctx, nullptr), "rknn_run");
   const auto t_run1 = std::chrono::steady_clock::now();
@@ -252,21 +332,21 @@ std::vector<Detection> RknnDetector::detect(const cv::Mat& frame) {
     }
   }
 
-  // ===== 第 3 步: 取输出(单输出取 1 个, 双输出取 2 个) =====
+  // ===== 第 3 步：读取输出（单输出取 1 个，双输出取 2 个）=====
   const int n_out = impl_->n_output;
   std::vector<rknn_output> outputs(static_cast<size_t>(n_out));
   for (int i = 0; i < n_out; ++i) {
     std::memset(&outputs[static_cast<size_t>(i)], 0, sizeof(rknn_output));
     outputs[static_cast<size_t>(i)].index = i;
-    // 交给驱动反量化(want_float=1)。实测这条路径对 int8 输出也是对的,
-    // 自己手工反量化反而会和驱动冲突。
+    // 由驱动完成反量化。该路径对 int8 输出同样有效；
+    // 手工反量化会与驱动的处理冲突。
     outputs[static_cast<size_t>(i)].want_float = 1;
-    outputs[static_cast<size_t>(i)].is_prealloc = 0;   // 让库自己分配, 用完调 release
+    outputs[static_cast<size_t>(i)].is_prealloc = 0;   // 由库分配，用完调用 release
   }
   check(rknn_outputs_get(impl_->ctx, n_out, outputs.data(), nullptr), "rknn_outputs_get");
 
-  // 两种模型在这里归一成同一套读法: coord 前 4 行是 cx cy w h, score 是各类分数
-  // int8 输出先反量化到 float 缓冲, 后面的逻辑完全不感知量化
+  // 两种模型在此统一为同一读取方式：coord 前 4 行为 cx cy w h，score 为各类分数。
+  // int8 输出先反量化到 float 缓冲，后续逻辑无需感知量化。
   std::vector<float> coord_buf;
   std::vector<float> score_buf;
 
@@ -292,7 +372,7 @@ std::vector<Detection> RknnDetector::detect(const cv::Mat& frame) {
   const int n_cols = impl_->n_cols;
   const int n_cls = impl_->n_cls;
 
-  // ===== 第 4 步: 分数过滤. 每个候选框取分数最高的类别 =====
+  // ===== 第 4 步：分数过滤。每个候选框取分数最高的类别 =====
   std::vector<Detection> boxes;
   boxes.reserve(64);
   for (int i = 0; i < n_cols; ++i) {
@@ -307,16 +387,49 @@ std::vector<Detection> RknnDetector::detect(const cv::Mat& frame) {
     }
     if (best < conf_) continue;
 
-    const double cx = coord[static_cast<size_t>(0) * n_cols + i];
-    const double cy = coord[static_cast<size_t>(1) * n_cols + i];
-    const double w = coord[static_cast<size_t>(2) * n_cols + i];
-    const double h = coord[static_cast<size_t>(3) * n_cols + i];
+    double x1, y1, x2, y2;   // 640 空间中的左上、右下坐标（未扣除补边）
+    if (impl_->boxes_is_dist) {
+      // head4：输出为四个距离，转换为边界坐标
+      //   coord[0..3] 依次为左 l、上 t、右 r、下 b 距离（单位为网格数，值域 0~15）
+      //   x1 = anchor_x - l    x2 = anchor_x + r
+      //   y1 = anchor_y - t    y2 = anchor_y + b
+      // 再乘 stride 映射到 640 空间。该换算与被移除的 9 个 ONNX 算子等价。
+      const size_t idx = static_cast<size_t>(i);
+      const double ax = impl_->anchor_x[idx];
+      const double ay = impl_->anchor_y[idx];
+      const double st = impl_->stride_tab[idx];
+
+      const double l = coord[idx];
+      const double t = coord[static_cast<size_t>(1) * n_cols + idx];
+      const double r = coord[static_cast<size_t>(2) * n_cols + idx];
+      const double b = coord[static_cast<size_t>(3) * n_cols + idx];
+
+      const double ex1 = ax - l;
+      const double ey1 = ay - t;
+      const double ex2 = ax + r;
+      const double ey2 = ay + b;
+
+      x1 = ex1 * st;
+      y1 = ey1 * st;
+      x2 = ex2 * st;
+      y2 = ey2 * st;
+    } else {
+      // ---- head3: 本来就是 cx cy w h，直接算 ----
+      const double cx = coord[static_cast<size_t>(0) * n_cols + i];
+      const double cy = coord[static_cast<size_t>(1) * n_cols + i];
+      const double w = coord[static_cast<size_t>(2) * n_cols + i];
+      const double h = coord[static_cast<size_t>(3) * n_cols + i];
+      x1 = cx - w / 2;
+      y1 = cy - h / 2;
+      x2 = cx + w / 2;
+      y2 = cy + h / 2;
+    }
 
     Detection d;
-    d.x1 = (cx - w / 2 - dx) / scale;
-    d.y1 = (cy - h / 2 - dy) / scale;
-    d.x2 = (cx + w / 2 - dx) / scale;
-    d.y2 = (cy + h / 2 - dy) / scale;
+    d.x1 = (x1 - dx) / scale;
+    d.y1 = (y1 - dy) / scale;
+    d.x2 = (x2 - dx) / scale;
+    d.y2 = (y2 - dy) / scale;
     d.score = best;
     d.cls = best_c;
     boxes.push_back(d);
@@ -324,32 +437,7 @@ std::vector<Detection> RknnDetector::detect(const cv::Mat& frame) {
 
   rknn_outputs_release(impl_->ctx, n_out, outputs.data());
 
-  // 调试: 前 3 帧把"分数最高多少、过了阈值几个"打出来, 确认定位问题用, 稳定后可删
-  static int dbg_n = 0;
-  if (dbg_n < 3) {
-    ++dbg_n;
-    double mx = -1e9;
-    int over = 0;
-    for (int i = 0; i < n_cols; ++i) {
-      const double sc = static_cast<double>(score[i]);
-      if (sc > mx) mx = sc;
-      if (sc >= conf_) ++over;
-    }
-    std::printf("[DBG] n_cols=%d n_cls=%d conf=%.3f 分数最高=%.3f 过阈值=%d 保留=%zu\n", n_cols,
-                n_cls, conf_, mx, over, boxes.size());
-    for (int k = 0; k < 3 && k < static_cast<int>(boxes.size()); ++k) {
-      std::printf("[DBG]   box%d 原图坐标 x1=%.1f y1=%.1f x2=%.1f y2=%.1f score=%.3f\n", k,
-                  boxes[k].x1, boxes[k].y1, boxes[k].x2, boxes[k].y2, boxes[k].score);
-    }
-    for (int k = 0; k < 3 && k < static_cast<int>(boxes.size()); ++k) {
-      const size_t idx = static_cast<size_t>(k);
-      std::printf("[DBG]   原始 cx=%.1f cy=%.1f w=%.1f h=%.1f\n", coord[idx],
-                  coord[(size_t)n_cols + idx], coord[(size_t)2 * n_cols + idx],
-                  coord[(size_t)3 * n_cols + idx]);
-    }
-  }
-
-  // ===== 第 5 步: NMS, 和 ONNX 版一字不差 =====
+  // ===== 第 5 步：NMS，与 ONNX 版完全一致 =====
   std::sort(boxes.begin(), boxes.end(),
             [](const Detection& a, const Detection& b) { return a.score > b.score; });
   std::vector<Detection> keep;

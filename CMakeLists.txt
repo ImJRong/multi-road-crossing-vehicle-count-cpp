@@ -141,3 +141,55 @@ if(USE_RKNN)
   set_target_properties(rknn_probe PROPERTIES
     BUILD_RPATH "${RKNN_ROOT}/lib")
 endif()
+
+# ---- 7. 多路并行评测工具 multi_eval ----
+# 批量评测模型：多线程同时跑多路视频，每个线程绑定不同的 NPU 核。
+# 用法: ./multi_eval configs/test1.json configs/test2.json --frames 3600
+if(USE_RKNN)
+  add_executable(multi_eval
+    src/multi_eval.cpp
+    src/config.cpp
+    src/counter.cpp
+    src/tracker.cpp
+    src/rknn_detector.cpp
+  )
+  target_include_directories(multi_eval PRIVATE
+    src
+    "${RKNN_ROOT}/include"
+    ${OpenCV_INCLUDE_DIRS}
+  )
+  target_compile_definitions(multi_eval PRIVATE
+    USE_RKNN
+    TRAFFIC_PROJECT_ROOT="${TRAFFIC_PROJECT_ROOT}")
+  target_link_libraries(multi_eval PRIVATE
+    "${RKNN_ROOT}/lib/librknnrt.so"
+    ${OpenCV_LIBS})
+  set_target_properties(multi_eval PROPERTIES
+    BUILD_RPATH "${RKNN_ROOT}/lib")
+endif()
+
+# ---- 8. 流水线性能测试 pipeline_bench ----
+# 并行推理 + 串行跟踪，用于测量两级流水的吞吐上限。
+# 用法: ./pipeline_bench configs/test1.json --workers 3 --frames 1000
+if(USE_RKNN)
+  add_executable(pipeline_bench
+    src/pipeline_bench.cpp
+    src/config.cpp
+    src/counter.cpp
+    src/tracker.cpp
+    src/rknn_detector.cpp
+  )
+  target_include_directories(pipeline_bench PRIVATE
+    src
+    "${RKNN_ROOT}/include"
+    ${OpenCV_INCLUDE_DIRS}
+  )
+  target_compile_definitions(pipeline_bench PRIVATE
+    USE_RKNN
+    TRAFFIC_PROJECT_ROOT="${TRAFFIC_PROJECT_ROOT}")
+  target_link_libraries(pipeline_bench PRIVATE
+    "${RKNN_ROOT}/lib/librknnrt.so"
+    ${OpenCV_LIBS})
+  set_target_properties(pipeline_bench PROPERTIES
+    BUILD_RPATH "${RKNN_ROOT}/lib")
+endif()

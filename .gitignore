@@ -30,3 +30,12 @@ dataset_calib*.txt
 
 data/videos
 
+
+# 转换过程的临时产物
+_smoke/
+models/step1_250/
+
+# 逐层量化误差 dump 的产物
+trace_1_6_0/
+trace_2_5_0/
+dataset_trace_*.txt

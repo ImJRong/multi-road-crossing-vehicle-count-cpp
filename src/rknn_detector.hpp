@@ -27,6 +27,11 @@ class RknnDetector {
 
   std::vector<Detection> detect(const cv::Mat& frame);
 
+  // 指定使用哪个 NPU 核：0 / 1 / 2，传 -1 表示三核共用（构造时的默认行为）。
+  // 多线程并行时应给每个实例分配不同的核，否则所有线程会挤在同一个核上。
+  // 须在构造之后、首次 detect 之前调用。
+  void set_core(int core_id);
+
  private:
   struct Impl;                 // 定义在 .cpp 里, 头文件不暴露 rknn_api.h
   std::unique_ptr<Impl> impl_;
