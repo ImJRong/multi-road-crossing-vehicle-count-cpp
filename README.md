@@ -116,7 +116,8 @@ traffic_count/
 ├── LICENSE                 学术使用许可（Academic Use Only）
 ├── .gitattributes          统一行尾（仓库内 LF）
 ├── docs/
-│   └── 技术文档.md         设计推导、实测数据、算法细节、踩坑记录
+│   ├── 技术文档.md         设计推导、实测数据、算法细节、踩坑记录
+│   └── 代码走读.md         逐文件逐函数讲解：每个函数干什么、为什么这么写
 ├── configs/                每个监控点一份 JSON（不入库，随部署生成）
 │   └── test1.json ~ test4.json
 ├── data/
@@ -153,6 +154,7 @@ traffic_count/
 | 想知道什么 | 去哪 |
 |---|---|
 | 设计推导、实测原始数据、算法细节、踩坑记录 | [docs/技术文档.md](docs/技术文档.md) |
+| 代码怎么读、每个函数在干什么 | [docs/代码走读.md](docs/代码走读.md) |
 | 框偏移的原理推导（11 张图） | Python 版仓库 [docs/head4_原理详解.md](https://github.com/ImJRong/multi-road-crossing-vehicle-count/blob/main/docs/head4_%E5%8E%9F%E7%90%86%E8%AF%A6%E8%A7%A3.md) |
 | 完整踩坑记录与交接文档 | Python 版仓库 [MEMORY.md](https://github.com/ImJRong/multi-road-crossing-vehicle-count/blob/main/MEMORY.md) |
 | Python 原型（同类算法的参照实现） | [multi-road-crossing-vehicle-count](https://github.com/ImJRong/multi-road-crossing-vehicle-count) |
