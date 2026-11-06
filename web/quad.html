@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>车流量统计 · 四路监控台</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: #F5F6F8; color: #1F2329;
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    font-size: 13px;
+  }
+  .app { height: 100%; display: flex; flex-direction: column; padding: 12px; gap: 10px; }
+
+  header {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    background: #fff; border: 1px solid #E8EAED; border-radius: 10px; padding: 10px 14px;
+  }
+  header .title { font-size: 14px; font-weight: 500; margin-right: 6px; }
+  select, button, input[type=number] {
+    font-family: inherit; font-size: 13px; padding: 6px 10px;
+    border: 1px solid #D8DCE1; border-radius: 7px; background: #fff; color: #1F2329;
+    cursor: pointer;
+  }
+  input[type=number] { cursor: text; width: 72px; }
+  button:hover { background: #F2F4F7; }
+  button.primary { background: #185FA5; border-color: #185FA5; color: #fff; }
+  button.primary:hover { background: #144E8A; }
+  button.warn { color: #A32D2D; border-color: #F0C4C4; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .status { display: flex; align-items: center; gap: 12px; color: #6B7280; margin-left: auto; flex-wrap: wrap; }
+  .status b { color: #1F2329; font-weight: 500; }
+
+  /* ---- 监控台: 四张卡片, 卡片里直接放缩略图 ---- */
+  .grid { flex: 1; display: grid; grid-template-columns: repeat(2, 1fr); grid-template-rows: repeat(2, 1fr); gap: 10px; min-height: 0; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; grid-template-rows: repeat(4, 1fr); } }
+
+  .cam {
+    background: #fff; border: 1px solid #E8EAED; border-radius: 10px; padding: 10px;
+    display: flex; flex-direction: column; gap: 8px; cursor: pointer; overflow: hidden; min-height: 0;
+  }
+  .cam:hover { border-color: #185FA5; }
+  .cam .thumb {
+    flex: 1; background: #14161A; border-radius: 8px; overflow: hidden;
+    display: flex; align-items: center; justify-content: center; min-height: 0;
+  }
+  .cam .thumb img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; }
+  .cam .cam-head { display: flex; align-items: center; gap: 8px; }
+  .cam .cam-name { font-size: 14px; font-weight: 500; }
+  .cam .cam-lv { margin-left: auto; font-size: 11px; color: #B4B2A9; }
+  .cam .counts { display: flex; flex-wrap: wrap; gap: 6px; }
+  .linebox { background: #F5F6F8; border-radius: 7px; padding: 4px 10px; min-width: 62px; }
+  .linebox .n { font-size: 10px; color: #6B7280; }
+  .linebox .v { font-size: 19px; font-weight: 500; line-height: 1.15; }
+  .cam .metrics { display: flex; gap: 12px; font-size: 11px; color: #6B7280; flex-wrap: wrap; }
+  .cam .metrics b { color: #1F2329; font-weight: 500; }
+
+  /* ---- 单路视图 ---- */
+  main { flex: 1; display: grid; grid-template-columns: minmax(0,1fr) 300px; gap: 10px; min-height: 0; }
+  .video {
+    background: #14161A; border-radius: 10px; overflow: hidden;
+    display: flex; align-items: center; justify-content: center; min-height: 0;
+  }
+  .video img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; }
+  .placeholder { color: #6B7280; font-size: 13px; }
+
+  aside { display: flex; flex-direction: column; gap: 10px; min-height: 0; overflow-y: auto; }
+  .card { background: #fff; border: 1px solid #E8EAED; border-radius: 10px; padding: 12px; }
+  .card h4 { margin: 0 0 10px; font-size: 12px; font-weight: 500; color: #6B7280; }
+  .muted { color: #6B7280; font-size: 12px; }
+  .rows { display: flex; flex-direction: column; gap: 6px; }
+  .rows .r { display: flex; gap: 8px; font-size: 12px; align-items: center; }
+  .rows .r .t { color: #6B7280; width: 52px; flex: none; }
+  .rows .r .v { color: #1F2329; }
+  .rows img.snap { width: 46px; height: 46px; object-fit: cover; border-radius: 5px;
+                    border: 1px solid #E8EAED; cursor: pointer; }
+
+  label.row { display: flex; align-items: center; gap: 7px; margin-bottom: 7px; cursor: pointer; user-select: none; }
+  label.row input { margin: 0; accent-color: #185FA5; }
+  .params { display: flex; gap: 8px; align-items: center; margin-bottom: 9px; }
+  .params label { font-size: 12px; color: #6B7280; }
+  .hidden { display: none !important; }
+
+  /* ---- 视频源卡片 ---- */
+  .srcbox { background: #fff; border: 1px solid #E8EAED; border-radius: 10px; padding: 10px 14px; }
+  .srcbox .hd { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .srcbox .hd b { font-size: 13px; font-weight: 500; }
+  .srcbox .hd span { font-size: 11px; color: #6B7280; }
+  .srcbox .row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .srcbox .row:last-child { margin-bottom: 0; }
+  .srcbox .lbl { width: 52px; font-size: 12px; color: #6B7280; flex: none; }
+  .srcbox select { width: 108px; flex: none; }
+  .srcbox select.val { width: 250px; }
+  .srcbox input[type=text] {
+    flex: 1; min-width: 0; font-family: inherit; font-size: 12px; padding: 6px 10px;
+    border: 1px solid #D8DCE1; border-radius: 7px; color: #1F2329; cursor: text;
+  }
+  .srcbox button { padding: 6px 12px; flex: none; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; display: inline-block; }
+  .dot.run { background: #2E9E5B; }
+  .dot.idle { background: #C4C8CE; }
+  .srcstate { font-size: 11px; color: #6B7280; width: 62px; flex: none; }
+  .stopped { position: fixed; inset: 0; background: rgba(20,22,26,.82); color: #fff;
+             display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 14px; z-index: 99; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <button id="btnBack" class="hidden">← 返回监控台</button>
+    <span class="title" id="hdTitle">车流量统计 · 四路监控台</span>
+    <button id="btnPause">暂停</button>
+    <button id="btnStop" class="warn">结束检测</button>
+    <button id="btnStart" class="primary hidden">重新开始</button>
+    <div id="sysbar" class="status"></div>
+  </header>
+
+  <!-- ============ 监控台 ============ -->
+  <div id="sidebar">
+    <div class="srcbox">
+      <div class="hd"><b>视频源</b><span>填本地文件路径或 rtsp:// 地址，留空表示空闲</span></div>
+      <div id="srcRows"></div>
+    </div>
+  </div>
+  <div id="dash" class="grid"></div>
+
+  <!-- ============ 单路 ============ -->
+  <main id="single" class="hidden">
+    <div class="video"><img id="bigImg" alt=""></div>
+    <aside>
+      <div class="card">
+        <h4>视频源</h4>
+        <div style="display:flex;flex-direction:column;gap:7px;margin-bottom:8px">
+          <div style="display:flex;gap:8px;align-items:center">
+            <select id="sType" style="flex:none;width:100px">
+              <option value="file">本地视频</option>
+              <option value="stream">视频流</option></select>
+            <select id="sVid" style="flex:1;min-width:0"></select>
+            <input type="text" id="sUrl" class="hidden"
+                   placeholder="rtsp://192.168.1.101:8554/test2"
+                   style="flex:1;min-width:0;font-family:inherit;font-size:12px;padding:6px 10px;border:1px solid #D8DCE1;border-radius:7px">
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <span style="font-size:12px;color:#6B7280;width:52px">配置</span>
+            <select id="sCfg" style="flex:1;min-width:0"></select>
+          </div>
+        </div>
+        <div><button class="primary" id="sApply">接入</button>
+             <button id="sStop">停止</button></div>
+      </div>
+      <div class="card">
+        <h4>计数</h4>
+        <div class="counts" id="lines"></div>
+      </div>
+      <div class="card">
+        <h4>运行状态</h4>
+        <div class="rows" id="metrics"></div>
+      </div>
+      <div class="card">
+        <h4>参数（只影响这一路）</h4>
+        <div class="params">
+          <label>conf</label><input type="number" id="conf" step="0.01" min="0" max="1">
+          <label>iou</label><input type="number" id="iou" step="0.01" min="0" max="1">
+          <button class="primary" id="apply">应用</button>
+        </div>
+        <label class="row"><input type="checkbox" id="ovBox" checked> 检测框</label>
+        <label class="row"><input type="checkbox" id="ovId" checked> 编号</label>
+        <label class="row"><input type="checkbox" id="ovLine" checked> 计数线</label>
+        <label class="row"><input type="checkbox" id="ovRoi" checked> 检测区域</label>
+        <div style="margin-top:8px"><button id="btnRestart1">重新跑这一路</button></div>
+      </div>
+      <div class="card">
+        <h4>最近过车（含截图）</h4>
+        <div class="rows" id="events"></div>
+      </div>
+    </aside>
+  </main>
+</div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const NAMES = ['路口 1', '路口 2', '路口 3', '路口 4'];
+let curCam = null;        // null = 监控台
+let stopped = false;
+let thumbImgs = [];       // 监控台上的 4 个缩略图元素
+let cfgList = [];         // configs/*.json 的名字
+let vidList = [];         // data/videos 下的视频文件
+
+function qget(k, d) { return new URLSearchParams(location.search).get(k) ?? d; }
+
+// ---------------- 视频源 ----------------
+async function loadConfigs() {
+  try {
+    const d = await (await fetch('/api/configs')).json();
+    cfgList = d.configs || [];
+  } catch (e) { cfgList = []; }
+  try {
+    const v = await (await fetch('/api/videos')).json();
+    vidList = v.videos || [];
+  } catch (e) { vidList = []; }
+  return cfgList;
+}
+
+// 判断地址是否为视频流
+function isStreamUrl(u) {
+  return /^(rtsp|rtsps|http|https):\/\//i.test(u || '');
+}
+
+function cfgOptions(cur) {
+  if (!cfgList.length) return '<option>' + (cur || '') + '</option>';
+  const has = cfgList.indexOf(cur) >= 0;
+  let h = has ? '' : '<option>' + (cur || '') + '</option>';
+  return h + cfgList.map(n =>
+    '<option' + (n === cur ? ' selected' : '') + '>' + n + '</option>').join('');
+}
+
+function vidOptions(cur) {
+  if (!vidList.length) return '<option value="">(data/videos 下没有视频)</option>';
+  const has = vidList.indexOf(cur) >= 0;
+  const head = (cur && !has) ? '<option value="' + cur + '" selected>' + cur + '（不在列表）</option>' : '';
+  return head + vidList.map(n =>
+    '<option value="' + n + '"' + (n === cur ? ' selected' : '') + '>' + n + '</option>').join('');
+}
+
+function buildSrcRows() {
+  const box = $('#srcRows');
+  box.innerHTML = '';
+  for (let i = 0; i < 4; i++) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML =
+      '<span class="lbl">' + NAMES[i] + '</span>' +
+      '<select id="st' + i + '" title="视频源类型">' +
+      '<option value="file">本地视频</option>' +
+      '<option value="stream">视频流</option></select>' +
+      '<select id="sv' + i + '" class="val" title="选本地视频"></select>' +
+      '<input type="text" id="su' + i + '" class="val hidden" placeholder="rtsp://192.168.1.101:8554/test2">' +
+      '<select id="sf' + i + '" title="用哪份配置(ROI/计数线/阈值)"></select>' +
+      '<button id="sa' + i + '">接入</button>' +
+      '<button id="sq' + i + '">断开</button>' +
+      '<span class="dot idle" id="sd' + i + '"></span>' +
+      '<span class="srcstate" id="ss' + i + '">空闲</span>';
+    box.appendChild(row);
+  }
+}
+
+// 切类型: 本地视频显示下拉, 视频流显示输入框
+function switchType(cam) {
+  const t = document.getElementById('st' + cam).value;
+  document.getElementById('sv' + cam).classList.toggle('hidden', t !== 'file');
+  document.getElementById('su' + cam).classList.toggle('hidden', t !== 'stream');
+}
+
+// 接入: 地址 + 配置名一起提交; 地址为空 = 停这一路
+function applySource(cam) {
+  const t = document.getElementById('st' + cam).value;
+  const url = (t === 'file')
+    ? document.getElementById('sv' + cam).value.trim()
+    : document.getElementById('su' + cam).value.trim();
+  const cfg = document.getElementById('sf' + cam).value;
+  // 不刷新整页(重载会重拉四条 MJPEG 流, 又慢又闪), 也不回填界面:
+  // 界面上的选择由用户维护, 状态点等待下一次轮询更新为"运行中".
+  fetch('/api/source?cam=' + cam + '&url=' + encodeURIComponent(url) +
+        '&config=' + encodeURIComponent(cfg));
+}
+
+// 断开: 这一路停下. 服务端保留地址和配置, 界面也不清空, 想再接入直接点"接入".
+function stopSource(cam) {
+  fetch('/api/source?cam=' + cam + '&stop=1');
+}
+
+// 把后端返回的地址/配置/空闲状态填回界面
+function fillSources(states) {
+  for (let i = 0; i < 4; i++) {
+    const st = states[i];
+    if (!st) continue;
+    const sel = document.getElementById('sf' + i);
+    const inp = document.getElementById('su' + i);
+    const dot = document.getElementById('sd' + i);
+    const tx = document.getElementById('ss' + i);
+    if (!sel || !inp) continue;
+    // 只在第一次(或这一路刚被程序重新接上)按服务器状态填一次.
+    // 之后界面上的选择归用户, 断开也不清空, 免得每次都要重选重填.
+    if (!sel.dataset.filled) {
+      sel.innerHTML = cfgOptions(st.config);
+      sel.dataset.filled = '1';
+      const src = st.source || '';
+      const typed = isStreamUrl(src);
+      const typeSel = document.getElementById('st' + i);
+      typeSel.value = typed ? 'stream' : 'file';
+      typeSel.onchange = () => switchType(i);
+      const vidSel = document.getElementById('sv' + i);
+      vidSel.innerHTML = vidOptions(src);
+      inp.value = typed ? src : '';
+      switchType(i);
+      document.getElementById('sa' + i).onclick = () => applySource(i);
+      document.getElementById('sq' + i).onclick = () => stopSource(i);
+    }
+    const idle = st.idle === 1;
+    dot.className = 'dot ' + (idle ? 'idle' : 'run');
+    tx.textContent = idle ? '空闲' : ('运行中 · ' + (st.fps || 0).toFixed(1) + ' fps');
+    // 运行中不许改源, 要改先点断开. 断开只停服务, 上面的选择不动.
+    for (const p of ['st', 'sv', 'su', 'sf']) {
+      const el = document.getElementById(p + i);
+      if (el) el.disabled = !idle;
+    }
+    document.getElementById('sa' + i).disabled = !idle;
+    document.getElementById('sq' + i).disabled = idle;
+  }
+}
+
+// ---------------- 监控台 ----------------
+function buildDash() {
+  const d = $('#dash');
+  d.innerHTML = '';
+  thumbImgs = [];
+  for (let i = 0; i < 4; i++) {
+    const el = document.createElement('div');
+    el.className = 'cam';
+    el.innerHTML =
+      '<div class="thumb"><img alt=""></div>' +
+      '<div class="cam-head"><span class="dot run"></span>' +
+      '<span class="cam-name">' + NAMES[i] + '</span>' +
+      '<span class="cam-lv">CAM ' + i + '</span></div>' +
+      '<div class="counts" id="c' + i + '"></div>' +
+      '<div class="metrics" id="m' + i + '"></div>';
+    const img = el.querySelector('img');
+    img.src = '/stream?cam=' + i + '&thumb=1';
+    thumbImgs.push(img);
+    el.onclick = () => { location.search = '?cam=' + i; };
+    d.appendChild(el);
+  }
+}
+
+// 断开所有缩略图连接(进单路时调用, 服务端就停止编码这些路)
+function dropThumbs() {
+  thumbImgs.forEach(im => { im.src = ''; });
+  thumbImgs = [];
+}
+
+function lineBoxes(el, lines) {
+  if (!lines || !lines.length) { el.innerHTML = '<span class="muted">等待数据…</span>'; return; }
+  el.innerHTML = lines.map(l =>
+    '<div class="linebox"><div class="n">' + l.name + '</div><div class="v">' + l.count + '</div></div>'
+  ).join('');
+}
+
+function metricsHtml(st) {
+  return '<span>fps <b>' + (st.fps || 0).toFixed(1) + '</b></span>' +
+         '<span>帧 <b>' + (st.frame || 0) + '</b></span>' +
+         '<span>跟踪 <b>' + (st.tracks || 0) + '</b></span>' +
+         '<span>推理 <b>' + (st.infer || 0).toFixed(0) + 'ms</b></span>';
+}
+
+async function pollDash() {
+  const states = [];
+  for (let i = 0; i < 4; i++) {
+    try {
+      const st = await (await fetch('/api/state?cam=' + i)).json();
+      states.push(st);
+      lineBoxes($('#c' + i), st.lines);
+      $('#m' + i).innerHTML = metricsHtml(st);
+      if (st.state === 0) setStopped(true);
+    } catch (e) { states.push(null); }
+  }
+  fillSources(states);
+  try {
+    const st = await (await fetch('/api/state?cam=0')).json();
+    $('#sysbar').innerHTML =
+      '<span>CPU <b>' + (st.cpu || 0).toFixed(0) + '%</b></span>' +
+      '<span>温度 <b>' + (st.temp || 0).toFixed(0) + '℃</b></span>' +
+      '<span>NPU <b>' + (st.npu || 0) + 'MHz</b></span>' +
+      '<span>核负载 <b>' + (st.npu_load || []).join('/') + '%</b></span>';
+  } catch (e) { /* 忽略 */ }
+}
+
+// ---------------- 单路 ----------------
+function showSingle(cam) {
+  curCam = cam;
+  $('#dash').classList.add('hidden');
+  $('#sidebar').classList.add('hidden');
+  $('#single').classList.remove('hidden');
+  $('#btnBack').classList.remove('hidden');
+  $('#hdTitle').textContent = NAMES[cam] + ' · CAM ' + cam;
+  dropThumbs();                       // 关掉 4 个缩略图, 服务端停止编码
+  $('#bigImg').src = '/stream?cam=' + cam;   // 只推这一路全图
+
+  fetch('/api/state?cam=' + cam).then(r => r.json()).then(st => {
+    $('#conf').value = st.conf; $('#iou').value = st.iou;
+    $('#sCfg').innerHTML = cfgOptions(st.config);
+    const src = st.source || '';
+    const typed = isStreamUrl(src);
+    $('#sType').value = typed ? 'stream' : 'file';
+    $('#sVid').innerHTML = vidOptions(src);
+    $('#sUrl').value = typed ? src : '';
+    const sync1 = () => {
+      const t = $('#sType').value;
+      $('#sVid').classList.toggle('hidden', t !== 'file');
+      $('#sUrl').classList.toggle('hidden', t !== 'stream');
+    };
+    $('#sType').onchange = sync1;
+    sync1();
+  });
+  $('#sApply').onclick = () => {
+    const t = $('#sType').value;
+    const url = (t === 'file') ? $('#sVid').value.trim() : $('#sUrl').value.trim();
+    fetch('/api/source?cam=' + cam + '&url=' + encodeURIComponent(url) +
+          '&config=' + encodeURIComponent($('#sCfg').value));
+  };
+  $('#sStop').onclick = () => fetch('/api/source?cam=' + cam + '&stop=1');
+
+  $('#apply').onclick = () => {
+    fetch('/api/param?cam=' + cam + '&conf=' + $('#conf').value + '&iou=' + $('#iou').value);
+  };
+  const ov = (id, key) => {
+    $(id).onchange = () => fetch('/api/overlay?cam=' + cam + '&' + key + '=' + ($(id).checked ? 1 : 0));
+  };
+  ov('#ovBox', 'box'); ov('#ovId', 'id'); ov('#ovLine', 'line'); ov('#ovRoi', 'roi');
+  $('#btnRestart1').onclick = () => fetch('/api/restart?cam=' + cam);
+
+  pollSingle(cam);
+  setInterval(() => pollSingle(cam), 1000);
+}
+
+async function pollSingle(cam) {
+  try {
+    const st = await (await fetch('/api/state?cam=' + cam)).json();
+    lineBoxes($('#lines'), st.lines);
+    $('#metrics').innerHTML =
+      '<div class="r"><span class="t">fps</span><span class="v">' + (st.fps || 0).toFixed(1) + '</span></div>' +
+      '<div class="r"><span class="t">帧号</span><span class="v">' + (st.frame || 0) + '</span></div>' +
+      '<div class="r"><span class="t">跟踪</span><span class="v">' + (st.tracks || 0) + '</span></div>' +
+      '<div class="r"><span class="t">推理</span><span class="v">' + (st.infer || 0).toFixed(0) + ' ms</span></div>' +
+      '<div class="r"><span class="t">CPU</span><span class="v">' + (st.cpu || 0).toFixed(0) + '%</span></div>' +
+      '<div class="r"><span class="t">温度</span><span class="v">' + (st.temp || 0).toFixed(0) + ' ℃</span></div>';
+    if (st.state === 0) setStopped(true);
+  } catch (e) { /* 忽略 */ }
+
+  try {
+    const d = await (await fetch('/api/events?cam=' + cam)).json();
+    const ev = d.events || [];
+    $('#events').innerHTML = ev.length
+      ? ev.slice(0, 15).map(e =>
+          '<div class="r">' +
+          (e.snap ? '<img class="snap" src="/snap/' + e.snap + '" onclick="window.open(\'/snap/' + e.snap + '\')">' : '') +
+          '<span class="t">' + e.line + '</span><span class="v">帧' + e.frame + '</span></div>').join('')
+      : '<span class="muted">暂无记录</span>';
+  } catch (e) { /* 忽略 */ }
+}
+
+// ---------------- 结束 / 暂停 ----------------
+function setStopped(v) {
+  stopped = v;
+  $('#btnStop').classList.toggle('hidden', v);
+  $('#btnStart').classList.toggle('hidden', !v);
+  $('#btnPause').classList.toggle('hidden', v);
+  if (v && !document.getElementById('stopMask')) {
+    const d = document.createElement('div');
+    d.id = 'stopMask';
+    d.className = 'stopped';
+    d.innerHTML = '<div style="font-size:16px">检测已结束</div>' +
+                  '<button class="primary" id="btnStart2">重新开始</button>';
+    document.body.appendChild(d);
+    $('#btnStart2').onclick = doStart;
+  } else if (!v) {
+    const m = document.getElementById('stopMask');
+    if (m) m.remove();
+  }
+}
+
+function doStart() {
+  fetch('/api/start?config=all');
+  setStopped(false);
+  setTimeout(() => location.reload(), 1500);
+}
+
+$('#btnStop').onclick = () => fetch('/api/quit');
+$('#btnStart').onclick = doStart;
+$('#btnPause').onclick = async () => {
+  const st = await (await fetch('/api/state?cam=0')).json();
+  const next = (st.state === 2) ? 0 : 1;
+  await fetch('/api/pause?on=' + next);
+  $('#btnPause').textContent = (next === 2) ? '继续' : '暂停';
+};
+$('#btnBack').onclick = () => { location.search = ''; };
+
+// ---------------- 启动 ----------------
+const camParam = qget('cam', null);
+loadConfigs().then(() => {
+  if (camParam !== null && camParam !== '') {
+    showSingle(parseInt(camParam, 10));
+  } else {
+    buildDash();
+    buildSrcRows();
+    pollDash();
+    setInterval(pollDash, 1000);
+  }
+});
+</script>
+</body>
+</html>
