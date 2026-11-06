@@ -21,6 +21,7 @@ Python 版：https://github.com/ImJRong/multi-road-crossing-vehicle-count
 | 改配置（ROI、计数线、阈值） | 本文 §五 |
 | 转模型 / 换模型 | 本文 §六、§七 |
 | 批量评测模型、看性能数字 | 本文 §七点五、§七点六 |
+| 用网页看实时画面、改参数 | 本文 §十二（单路）、§十二点五（四路分屏） |
 | 懂原理（为什么这样设计） | 本文 §八~§十一 |
 | 完整踩坑记录、交接文档 | [Python 版 MEMORY.md](https://github.com/ImJRong/multi-road-crossing-vehicle-count/blob/main/MEMORY.md) |
 | **框偏移的原理推导（带 11 张图）** | [docs/head4_原理详解.md](https://github.com/ImJRong/multi-road-crossing-vehicle-count/blob/main/docs/head4_%E5%8E%9F%E7%90%86%E8%AF%A6%E8%A7%A3.md) |
@@ -30,7 +31,7 @@ Python 版：https://github.com/ImJRong/multi-road-crossing-vehicle-count
 
 ---
 
-## 一、现在是什么状态（2026-11-02）
+## 一、现在是什么状态（2026-11-06）
 
 | 项 | 状态 |
 |---|---|
@@ -39,6 +40,7 @@ Python 版：https://github.com/ImJRong/multi-road-crossing-vehicle-count
 | 网页实时显示 | ✅ MJPEG 推流 |
 | 跟踪 + 过线计数 | ✅ 能跑 |
 | 参数实时调整 | ✅ 网页改 conf/iou 立即生效 |
+| 四路并行分屏 | ✅ `traffic_web_quad`，四路各 20 fps（板端实测） |
 | 系统状态显示 | ✅ CPU / 温度 / NPU 频率 / 三核负载 |
 
 ### 框偏移已解决（2026-11-02）
@@ -82,10 +84,11 @@ Python 版：https://github.com/ImJRong/multi-road-crossing-vehicle-count
 
 ```
 CMakeLists.txt          编译配置（主程序 + rknn_probe）
-web.cmake               网页版 traffic_web_single 的构建规则
+web.cmake               网页版构建规则（traffic_web_single 与 traffic_web_quad）
 src/
   main.cpp              命令行入口：读配置 → 裁 ROI → 循环 → 画图 → 存视频
-  web_main_single.cpp   网页版入口：会话管理（开始/停止/重开）+ 主循环 + 抓拍
+  web_main_single.cpp   网页版入口（单路）：会话管理（开始/停止/重开）+ 主循环 + 抓拍
+  web_main_quad.cpp     网页版入口（四路）：四路并行 + 分屏 + 每路独立参数
   web_server.cpp/.hpp   网页版 HTTP 服务：MJPEG 推流 / 状态 JSON / 控制命令
   config.cpp/.hpp       解析 configs/*.json
   counter.cpp/.hpp      穿线计数：判在哪一侧、死区、换边加一
@@ -98,7 +101,8 @@ src/
   mini_json.hpp         JSON 解析，不依赖第三方库
   recorder.hpp          过线记录写 csv
 web/
-  index.html            网页监控台页面（CSS/JS 内嵌，不依赖 CDN）
+  index.html            单路监控台页面（CSS/JS 内嵌，不依赖 CDN）
+  quad.html             四路分屏页面（点某一路进该路详情）
 ```
 
 **为什么拆这么细**：换推理后端时只动一个文件（`detector.cpp` ↔ `rknn_detector.cpp`），`main.cpp` 一行不用改。头文件放声明，源文件放实现，因为每个 `.cpp` 是单独编译的。
@@ -603,8 +607,10 @@ make pipeline_bench
 `traffic_count` 是"给个配置就跑到底、跑完退出"，`traffic_web_single` 是"起来之后蹲在那，等网页下命令"。
 浏览器里选配置、点开始、拖参数、看画面和过车记录，不用碰命令行。
 
-两个可执行文件共用 `config.cpp` / `counter.cpp` / `tracker.cpp` / `detector.cpp`，
+三个可执行文件共用 `config.cpp` / `counter.cpp` / `tracker.cpp` / `detector.cpp`，
 网页版只多一个 `web_server.cpp`（HTTP + MJPEG 推流）。计数、跟踪、推理一行都没复制。
+
+`traffic_web_single` 管一路，`traffic_web_quad` 管四路（见十二点五）。
 
 ### 页面上有什么
 
@@ -672,6 +678,65 @@ make pipeline_bench
 
 ---
 
+## 十二点五、四路分屏（traffic_web_quad）
+
+一台板子同时跑四路视频，网页 2×2 分屏看，点某一路进详情页。计数、参数、图层各自独立。
+
+### 编译与启动
+
+```bash
+make traffic_web_quad
+# 位置参数: [端口] 配置1 配置2 配置3 配置4 [每路fps]
+./traffic_web_quad 8081 test1 test2 test3 test4 20
+```
+
+不写端口用 8081，不写配置名自动按 test1~test4 补齐，不写 fps 用 20。
+后台常驻要用 `setsid`，`nohup ... &` 在非交互 shell 里会被回收：
+
+```bash
+setsid ./traffic_web_quad test1 test2 test3 test4 20 > /tmp/quad.log 2>&1 < /dev/null &
+```
+
+### 线程分配
+
+每路 2 个推理线程（`kInferPerCam = 2`），四路共 8 个，按 `(路号 × 2 + 槽位) % 3`
+轮流绑到 NPU 的三个核上，所以四路能真正并行而不是抢一个核。
+另有每路 1 个读帧线程 + 1 个跟踪线程。
+
+### 接口都带 cam 路号
+
+| 端点 | 作用 |
+|---|---|
+| `GET /` | 分屏页 |
+| `GET /stream?cam=N` | 第 N 路 MJPEG（`&thumb=1` 是缩略图） |
+| `GET /api/state?cam=N` | 第 N 路状态 |
+| `GET /api/param?cam=N&conf=0.3&iou=0.3` | 改第 N 路参数 |
+| `GET /api/restart?cam=N` | 第 N 路从头跑 |
+| `GET /api/overlay?cam=N&box=1&id=0&line=1&roi=1` | 第 N 路图层开关 |
+| `GET /api/start?config=all` | 四路一起开 |
+| `GET /api/pause?on=1` | 全部暂停 / 继续 |
+| `GET /api/quit` | 退出进程 |
+
+### 参数初值的来路
+
+启动时每路先读自己的 `configs/testN.json`，把 `detect.conf` / `detect.iou` 灌进
+`WebServer::init_params()` 当参数面板的初值；之后网页上改只动内存，
+**`configs/*.json` 一个字节都不写**，进程重开又回到 json 的值。
+
+单路版用 `params_inited` 标志实现同样的事，四路版直接在配置加载循环里调 `init_params`。
+放在视频检查之前，这样某路视频缺失时面板上显示的仍是它的配置值。
+
+### 实测（板端，2026-11-06）
+
+四路各 20 fps 稳定，单帧推理 40~60 ms，进程占 487% CPU（8 核）。
+
+**卡顿的来源**：4 条 MJPEG 常驻推流单条约 500 KB/s，四条合计约 2 MB/s；
+浏览器对同一主机只开 6 个并发连接，4 条流占满后状态轮询要排队，页面就越看越卡。
+首页本身不慢（13 KB，13~48 ms），状态接口 19~60 ms。
+治法是降缩略图帧率/分辨率，或把轮询合并成一次请求——尚未做。
+
+---
+
 ## 十三、已知问题
 
 1. **计数漏（已收尾）**：断号减少 34.3%，计数净增 12。剩余成因未查证。详见 `MEMORY.md` 6.1
@@ -679,20 +744,22 @@ make pipeline_bench
 3. **框轻微抖动**：INT8 量化噪声 + 卡尔曼。已删掉多余的 EMA（2026-11-01），只保留卡尔曼一层平滑
 4. **端口被占时仍打印「服务已启动」**：`main.cpp` 无条件打印，`web_server.cpp` 其实已经报错了
 5. **网页参数只存内存**，不写回 json，重启即恢复
+6. **四路分屏页面越看越卡**：4 条 MJPEG 常驻流占满浏览器 6 个并发连接，状态轮询排队。见十二点五
 
 ---
 
 ## 十四、还没做
 
 - 交叉编译到 aarch64（现在是在板子上直接编）
-- 多路并行 + 分屏（`multi_eval` 已验证四路并行，但那是纯评测，不出画面）
-- RTSP 实时流（现在只吃 mp4）
+- ~~多路并行 + 分屏~~ —— **已做**：`traffic_web_quad`，四路各 20 fps，见十二点五
+- RTSP 实时流（现在只吃 mp4，见下）
 - 事件和计数落库（现在只在内存留 200 条）
 - 人工真值全覆盖（目前只有 test3 的 B 线）
+- 四路分屏的卡顿（MJPEG 占满浏览器 6 连接，见十二点五）
 
-### 下一步：多路实时检测
+### 下一步：接实时流
 
-目标：一台设备同时接入 N 路监控流，网页分屏看，点某一路放大，各路独立计数、独立参数。
+四路分屏已经能跑了，但吃的还是 mp4。真正接摄像头还差下面几步（按顺序做）。
 
 **1. 视频源抽象**（最小改动，收益最大）
 
@@ -707,30 +774,22 @@ make pipeline_bench
 `cv::VideoCapture` 本身三者通吃，判断一下字符串是不是纯数字、是不是带 `://` 就行。
 真正的差别在**读不到帧怎么办**：mp4 读完了就结束，RTSP 断流要重连，不能把会话销毁。
 
-**2. 多会话管理**
+**2. 多会话管理**（已完成）
 
-把 `std::unique_ptr<Session>` 换成 `std::vector<std::unique_ptr<Session>>`，
-每一路一个线程跑自己的主循环，`WebServer` 仍然只有一个（多路共用一个端口）。
+`web_main_quad.cpp` 里是 `std::array<Cam, kMaxCams>`，每路读帧/推理/跟踪各一个线程，
+`WebServer` 只有一个、多路共用一个端口。`Detector` 每路一份，RKNN 上下文一路一个。
 
-`Detector` 必须**每路一份**：ONNX Runtime 的 `Session` 不是线程安全的，
-RKNN 的上下文也建议一路一个。代价是内存。
+**3. 接口加路号**（已完成）
 
-**3. 接口加路号**
+实际用的是 `cam=` 而不是 `ch=`，见十二点五的接口表。
 
-```
-GET /api/start?ch=0&config=test1
-GET /stream?ch=0
-GET /api/state            → {"channels":[{...},{...}]}
-```
+**4. 带宽要重新算**（真的撞上了）
 
-**4. 带宽要重新算**
+缩略图宽 480 px 时单条约 500 KB/s，四条合计约 2 MB/s，四条流就把浏览器的
+6 个并发连接占满了，状态轮询只能排队。降到每路 640 宽 / 5 fps 约 150 KB/s，
+或换架构（前端拉子码流，分析服务只推坐标 JSON 叠框）。
 
-现在一路 1080p@20fps 的 MJPEG 约 3 MB/s，本地看没问题。4 路就是 12 MB/s，
-浏览器解码和网络都吃不消。要么降规格（每路 640 宽 / 10 fps，约 0.5 MB/s），
-要么换架构（前端拉子码流，分析服务只推坐标 JSON 叠框）。
+**5. 前端**（已完成）
 
-**5. 前端**
-
-从"单画面 + 右侧面板"改成"分屏网格 + 单路详情"：
-- 总览页：2×2 / 3×3 网格，每格一个 `<img src="/stream?ch=N">`
-- 点某一格 → 进单路详情页，就是现在这个页面，多一个"返回"
+`web/quad.html`：2×2 网格，每格一条 `/stream?cam=N&thumb=1`；点某格进单路详情，
+就是单路版那个页面加一个"返回"。仍待改进的是带宽——见十二点五「卡顿的来源」。

@@ -37,6 +37,15 @@
 
 #include "rknn_api.h"
 
+// 静默开关: 多路并行时 8 个 detector 各打一套日志会刷屏, 关掉.
+namespace {
+bool g_verbose = true;
+}  // namespace
+
+void rknn_set_verbose(bool on) { g_verbose = on; }
+
+#define VPRINT(...) do { if (g_verbose) std::printf(__VA_ARGS__); } while (0)
+
 namespace {
 
 double iou(const Detection& a, const Detection& b) {
@@ -59,11 +68,11 @@ void check(int ret, const char* what) {
 
 // 打印张量维度，排查问题时的主要依据
 void print_dims(const char* tag, const rknn_tensor_attr& a) {
-  std::printf("%s dims=[", tag);
+  VPRINT("%s dims=[", tag);
   for (uint32_t i = 0; i < a.n_dims; ++i) {
-    std::printf("%d%s", a.dims[i], i + 1 == a.n_dims ? "" : ", ");
+    VPRINT("%d%s", a.dims[i], i + 1 == a.n_dims ? "" : ", ");
   }
-  std::printf("]\n");
+  VPRINT("]\n");
 }
 
 }  // namespace
@@ -114,9 +123,9 @@ RknnDetector::RknnDetector(const std::string& model_path, int imgsz, double conf
   // RK3588 含 3 个 NPU 核心，默认仅启用一个。此处切换为三核并行以提高推理吞吐。
   // 若调用方稍后用 set_core() 指定单核，会覆盖这里的设置。
   if (rknn_set_core_mask(impl_->ctx, RKNN_NPU_CORE_0_1_2) == 0) {
-    std::printf("NPU: 三核并行已开启\n");
+    VPRINT("NPU: 三核并行已开启\n");
   } else {
-    std::printf("NPU: 三核设置失败, 继续用默认单核\n");
+    VPRINT("NPU: 三核设置失败, 继续用默认单核\n");
   }
 
   // 3. 查询模型的输入输出数量
@@ -124,7 +133,7 @@ RknnDetector::RknnDetector(const std::string& model_path, int imgsz, double conf
   std::memset(&io_num, 0, sizeof(io_num));
   check(rknn_query(impl_->ctx, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num)),
         "rknn_query(IN_OUT_NUM)");
-  std::printf("RKNN 模型: 输入 %u 个, 输出 %u 个\n", io_num.n_input, io_num.n_output);
+  VPRINT("RKNN 模型: 输入 %u 个, 输出 %u 个\n", io_num.n_input, io_num.n_output);
 
   // 4. 打印输入形状
   rknn_tensor_attr in_attr;
@@ -133,7 +142,7 @@ RknnDetector::RknnDetector(const std::string& model_path, int imgsz, double conf
   check(rknn_query(impl_->ctx, RKNN_QUERY_INPUT_ATTR, &in_attr, sizeof(in_attr)),
         "rknn_query(INPUT_ATTR)");
   print_dims("输入:", in_attr);
-  std::printf("      fmt=%d type=%d\n", static_cast<int>(in_attr.fmt),
+  VPRINT("      fmt=%d type=%d\n", static_cast<int>(in_attr.fmt),
               static_cast<int>(in_attr.type));
 
   // 5. 查询输出形状，据此确定 n_rows / n_cols，不硬编码
@@ -198,17 +207,17 @@ RknnDetector::RknnDetector(const std::string& model_path, int imgsz, double conf
         impl_->out_quant[i] = true;
         impl_->out_scale[i] = a.scale;
         impl_->out_zp[i] = a.zp;
-        std::printf("输出[%d] int8: scale=%.6f zp=%d fmt=%d w_stride=%u n_elems=%u size=%u dims=[%d,%d,%d,%d]\n", i,
+        VPRINT("输出[%d] int8: scale=%.6f zp=%d fmt=%d w_stride=%u n_elems=%u size=%u dims=[%d,%d,%d,%d]\n", i,
                     static_cast<double>(a.scale), a.zp, static_cast<int>(a.fmt), a.w_stride,
                     a.n_elems, a.size, a.dims[0], a.dims[1], a.dims[2], a.dims[3]);
       } else {
-        std::printf("输出[%d] 是浮点（直接用）\n", i);
+        VPRINT("输出[%d] 是浮点（直接用）\n", i);
       }
     }
   }
 
   impl_->n_cols = cols > 0 ? cols : 8400;
-  std::printf("按 %s 解析: 类别 %d 个, 候选框 %d 个\n",
+  VPRINT("按 %s 解析: 类别 %d 个, 候选框 %d 个\n",
               impl_->n_output == 1 ? "单输出 [4+C, N]" : "双输出 boxes/scores", impl_->n_cls,
               impl_->n_cols);
 
@@ -243,7 +252,7 @@ RknnDetector::RknnDetector(const std::string& model_path, int imgsz, double conf
         impl_->stride_tab[static_cast<size_t>(i)] = s.stride;
       }
     }
-    std::printf("模型类型: head4（输出 DFL 距离，坐标在 CPU 里换算）\n");
+    VPRINT("模型类型: head4（输出 DFL 距离，坐标在 CPU 里换算）\n");
     {
       // 打印各段首尾，确认三个 stride 段的网格都生成对了
       struct { const char* tag; int lo; } chk[3] = {{"seg1(80x80, s8) ", 0},
@@ -252,13 +261,13 @@ RknnDetector::RknnDetector(const std::string& model_path, int imgsz, double conf
       for (const auto& c : chk) {
         const size_t lo = static_cast<size_t>(c.lo);
         const size_t hi = static_cast<size_t>(c.lo + (c.lo == 0 ? 6399 : (c.lo == 6400 ? 1599 : 399)));
-        std::printf("  %s 首(%.1f,%.1f) 尾(%.1f,%.1f) stride=%.0f\n", c.tag,
+        VPRINT("  %s 首(%.1f,%.1f) 尾(%.1f,%.1f) stride=%.0f\n", c.tag,
                     impl_->anchor_x[lo], impl_->anchor_y[lo], impl_->anchor_x[hi],
                     impl_->anchor_y[hi], impl_->stride_tab[lo]);
       }
     }
   } else {
-    std::printf("模型类型: head3（输出已是 cx cy w h 坐标，直接用）\n");
+    VPRINT("模型类型: head3（输出已是 cx cy w h 坐标，直接用）\n");
   }
 }
 
@@ -271,16 +280,16 @@ void RknnDetector::set_core(int core_id) {
   // RKNN_NPU_CORE_AUTO (0x0) 表示交给驱动自动选择，等同于不绑定。
   if (core_id < 0) {
     if (rknn_set_core_mask(impl_->ctx, RKNN_NPU_CORE_AUTO) == 0) {
-      std::printf("NPU: 恢复自动选择核\n");
+      VPRINT("NPU: 恢复自动选择核\n");
     }
     return;
   }
   const rknn_core_mask masks[3] = {RKNN_NPU_CORE_0, RKNN_NPU_CORE_1, RKNN_NPU_CORE_2};
   const int idx = core_id % 3;
   if (rknn_set_core_mask(impl_->ctx, masks[idx]) == 0) {
-    std::printf("NPU: 已绑定到核 %d\n", idx);
+    VPRINT("NPU: 已绑定到核 %d\n", idx);
   } else {
-    std::printf("NPU: 绑定核 %d 失败，继续使用默认设置\n", idx);
+    VPRINT("NPU: 绑定核 %d 失败，继续使用默认设置\n", idx);
   }
 }
 
@@ -326,7 +335,7 @@ std::vector<Detection> RknnDetector::detect(const cv::Mat& frame) {
     sum_in += std::chrono::duration<double, std::milli>(t_in1 - t_in0).count();
     sum_run += std::chrono::duration<double, std::milli>(t_run1 - t_run0).count();
     if (++cnt % 100 == 0) {
-      std::printf("[PERF] 喂数据 %.2f ms | NPU 计算 %.2f ms | 合计 %.2f ms（上限 %.1f fps）\n",
+      VPRINT("[PERF] 喂数据 %.2f ms | NPU 计算 %.2f ms | 合计 %.2f ms（上限 %.1f fps）\n",
                   sum_in / cnt, sum_run / cnt, (sum_in + sum_run) / cnt,
                   1000.0 / ((sum_in + sum_run) / cnt));
     }

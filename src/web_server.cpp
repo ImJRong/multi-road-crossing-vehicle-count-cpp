@@ -132,24 +132,49 @@ void WebServer::stop() {
     ::close(listen_fd_);
     listen_fd_ = -1;
   }
-  frame_cv_.notify_all();   // 叫醒所有正在等帧的推流线程
+  for (int i = 0; i < kMaxCams; ++i) frame_cv_[i].notify_all();   // 叫醒所有正在等帧的推流线程
   if (accept_thread_.joinable()) accept_thread_.join();
 }
 
 // ------------------------------ 帧与状态 ------------------------------
 
-void WebServer::push_frame(const cv::Mat& frame) {
+void WebServer::push_frame(const cv::Mat& frame, int cam) {
   if (frame.empty()) return;
-  std::vector<uchar> buf;
-  const std::vector<int> param = {cv::IMWRITE_JPEG_QUALITY, 75};
-  if (!cv::imencode(".jpg", frame, buf, param)) return;
+  if (cam < 0 || cam >= kMaxCams) return;
+
+  // 节流: 没人看这一路就什么都不做, 连 JPEG 编码都省掉
+  const bool need_full = full_viewers_[cam].load() > 0;
+  const bool need_thumb = thumb_viewers_[cam].load() > 0;
+  if (!need_full && !need_thumb) return;
 
   {
-    std::lock_guard<std::mutex> lk(frame_mu_);
-    jpeg_.swap(buf);
-    ++frame_seq_;
+    std::lock_guard<std::mutex> lk(frame_mu_[cam]);
+    if (need_full) {
+      std::vector<uchar> buf;
+      const std::vector<int> param = {cv::IMWRITE_JPEG_QUALITY, 75};
+      if (cv::imencode(".jpg", frame, buf, param)) {
+        jpeg_[cam].swap(buf);
+      }
+    }
+    if (need_thumb) {
+      // 缩略图: 宽度压到 kThumbWidth, 流量降 5 倍多
+      cv::Mat small;
+      const double sc = static_cast<double>(kThumbWidth) / frame.cols;
+      if (sc < 1.0) {
+        cv::resize(frame, small, cv::Size(kThumbWidth,
+                    std::max(1, static_cast<int>(frame.rows * sc))), cv::INTER_AREA);
+      } else {
+        small = frame;
+      }
+      std::vector<uchar> buf;
+      const std::vector<int> param = {cv::IMWRITE_JPEG_QUALITY, 68};
+      if (cv::imencode(".jpg", small, buf, param)) {
+        thumb_jpeg_[cam].swap(buf);
+      }
+    }
+    ++frame_seq_[cam];
   }
-  frame_cv_.notify_all();
+  frame_cv_[cam].notify_all();
 }
 
 void WebServer::sample_sys() {
@@ -209,13 +234,13 @@ void WebServer::sample_sys() {
 }
 
 void WebServer::update_stats(const std::vector<LineStat>& lines, int tracks, double fps,
-                             double infer_ms, int frame_no) {
+                             double infer_ms, int frame_no, int cam) {
   std::ostringstream os;
   os.precision(3);
   os << std::fixed;
   os << "{\"state\":" << state_.load() << ",\"frame\":" << frame_no
      << ",\"tracks\":" << tracks << ",\"fps\":" << fps << ",\"infer\":" << infer_ms
-     << ",\"conf\":" << conf_.load() << ",\"iou\":" << iou_.load() << ",\"lines\":[";
+     << ",\"conf\":" << conf_[cam].load() << ",\"iou\":" << iou_[cam].load() << ",\"lines\":[";
   for (size_t i = 0; i < lines.size(); ++i) {
     if (i) os << ',';
     os << "{\"name\":\"" << json_escape(lines[i].name) << "\",\"count\":" << lines[i].count
@@ -223,23 +248,25 @@ void WebServer::update_stats(const std::vector<LineStat>& lines, int tracks, dou
   }
   os << "]}";
   std::lock_guard<std::mutex> lk(stat_mu_);
-  state_json_ = os.str();
+  state_json_[cam] = os.str();
 }
 
-void WebServer::add_event(const Event& e) {
+void WebServer::add_event(const Event& e, int cam) {
+  if (cam < 0 || cam >= kMaxCams) return;
   std::lock_guard<std::mutex> lk(event_mu_);
-  events_.push_back(e);
-  while (events_.size() > 200) events_.pop_front();
+  events_[cam].push_back(e);
+  while (events_[cam].size() > 200) events_[cam].pop_front();
 }
 
-void WebServer::clear_events() {
+void WebServer::clear_events(int cam) {
+  if (cam < 0 || cam >= kMaxCams) return;
   std::lock_guard<std::mutex> lk(event_mu_);
-  events_.clear();
+  events_[cam].clear();
 }
 
-Command WebServer::take_command() {
-  const int c = cmd_.exchange(kCmdNone);
-  return static_cast<Command>(c);
+Command WebServer::take_command(int cam) {
+  if (cam < 0 || cam >= kMaxCams) return kCmdNone;
+  return static_cast<Command>(cmd_[cam].exchange(kCmdNone));
 }
 
 std::string WebServer::start_config() {
@@ -247,8 +274,9 @@ std::string WebServer::start_config() {
   return start_config_;
 }
 
-Overlay WebServer::overlay() const {
-  const int m = overlay_mask_.load();
+Overlay WebServer::overlay(int cam) const {
+  if (cam < 0 || cam >= kMaxCams) return Overlay();
+  const int m = overlay_mask_[cam].load();
   Overlay o;
   o.box = (m & 1) != 0;
   o.id = (m & 2) != 0;
@@ -257,8 +285,23 @@ Overlay WebServer::overlay() const {
   return o;
 }
 
-float WebServer::conf() const { return conf_.load(); }
-float WebServer::iou() const { return iou_.load(); }
+float WebServer::conf(int cam) const {
+  if (cam < 0 || cam >= kMaxCams) return 0.3f;
+  return conf_[cam].load();
+}
+float WebServer::iou(int cam) const {
+  if (cam < 0 || cam >= kMaxCams) return 0.5f;
+  return iou_[cam].load();
+}
+
+// 只在启动时由 main 调一次, 之后网页改值走 /api/param, 不再走这里.
+// 之所以单独开一个函数而不是让 main 直接调 /api/param 的解析逻辑:
+// 一是从 float 转字符串再转回来没必要, 二是不想让 HTTP 解析路径沾上初始化.
+void WebServer::init_params(int cam, float conf, float iou) {
+  if (cam < 0 || cam >= kMaxCams) return;
+  if (conf > 0.0f) conf_[cam].store(conf);   // 配置里漏写(<=0)就保留默认值
+  if (iou > 0.0f) iou_[cam].store(iou);
+}
 
 // ------------------------------ 监听与分发 ------------------------------
 
@@ -315,10 +358,16 @@ void WebServer::handle_client(int fd) {
 
 void WebServer::route(int fd, const std::string& /*method*/, const std::string& path,
                       const std::string& query) {
+  // cam = 第几路, 缺省 0(单路版行为不变)
+  const int cam_arg = std::atoi(query_get(query, "cam").c_str());
+  const int cam = (cam_arg < 0 || cam_arg >= kMaxCams) ? 0 : cam_arg;
+
   if (path == "/" || path == "/index.html") {
     serve_index(fd);
   } else if (path == "/stream") {
-    serve_stream(fd);
+    const std::string th = query_get(query, "thumb");
+    const bool thumb = !th.empty() && th != "0";
+    serve_stream(fd, cam, thumb);
   } else if (path == "/api/state") {
     std::string body;
     {
@@ -327,7 +376,17 @@ void WebServer::route(int fd, const std::string& /*method*/, const std::string& 
       std::string j;
       {
         std::lock_guard<std::mutex> lk(stat_mu_);
-        j = state_json_;
+        j = state_json_[cam];
+      }
+      // state 用实时值覆盖: 结束后没人再 update_stats, JSON 里是旧的
+      {
+        char stbuf[16];
+        std::snprintf(stbuf, sizeof(stbuf), "%d", state_.load());
+        const size_t sp = j.find("\"state\":");
+        if (sp != std::string::npos) {
+          const size_t ep = j.find(',', sp);
+          if (ep != std::string::npos) j.replace(sp + 8, ep - sp - 8, stbuf);
+        }
       }
       std::ostringstream sys;
       sys.precision(2);
@@ -368,7 +427,7 @@ void WebServer::route(int fd, const std::string& /*method*/, const std::string& 
     {
       std::lock_guard<std::mutex> lk(event_mu_);
       bool first = true;
-      for (auto it = events_.rbegin(); it != events_.rend(); ++it) {
+      for (auto it = events_[cam].rbegin(); it != events_[cam].rend(); ++it) {
         if (!first) body += ',';
         first = false;
         char ts[32];
@@ -387,13 +446,13 @@ void WebServer::route(int fd, const std::string& /*method*/, const std::string& 
       std::lock_guard<std::mutex> lk(cmd_mu_);
       start_config_ = cfg;
     }
-    cmd_.store(kCmdStart);
+    cmd_[cam].store(kCmdStart);
     serve_json(fd, "{\"ok\":1}");
   } else if (path == "/api/stop") {
-    cmd_.store(kCmdStop);
+    cmd_[cam].store(kCmdStop);
     serve_json(fd, "{\"ok\":1}");
   } else if (path == "/api/restart") {
-    cmd_.store(kCmdRestart);
+    cmd_[cam].store(kCmdRestart);
     serve_json(fd, "{\"ok\":1}");
   } else if (path == "/api/pause") {
     state_.store(flag_on(query_get(query, "on"), false) ? 2 : 1);
@@ -401,11 +460,14 @@ void WebServer::route(int fd, const std::string& /*method*/, const std::string& 
   } else if (path == "/api/param") {
     const std::string c = query_get(query, "conf");
     const std::string i = query_get(query, "iou");
-    if (!c.empty()) conf_.store(static_cast<float>(std::atof(c.c_str())));
-    if (!i.empty()) iou_.store(static_cast<float>(std::atof(i.c_str())));
+    if (!c.empty()) conf_[cam].store(static_cast<float>(std::atof(c.c_str())));
+    if (!i.empty()) iou_[cam].store(static_cast<float>(std::atof(i.c_str())));
+    serve_json(fd, "{\"ok\":1}");
+  } else if (path == "/api/quit") {
+    cmd_[0].store(kCmdQuit);   // 全局命令, 只走 0 号位
     serve_json(fd, "{\"ok\":1}");
   } else if (path == "/api/overlay") {
-    Overlay o = overlay();
+    Overlay o = overlay(cam);
     o.box = flag_on(query_get(query, "box"), o.box);
     o.id = flag_on(query_get(query, "id"), o.id);
     o.line = flag_on(query_get(query, "line"), o.line);
@@ -415,7 +477,7 @@ void WebServer::route(int fd, const std::string& /*method*/, const std::string& 
     if (o.id) m |= 2;
     if (o.line) m |= 4;
     if (o.roi) m |= 8;
-    overlay_mask_.store(m);
+    overlay_mask_[cam].store(m);
     serve_json(fd, "{\"ok\":1}");
   } else if (path.compare(0, 6, "/snap/") == 0) {
     serve_snap(fd, path.substr(6));
@@ -471,27 +533,36 @@ void WebServer::serve_snap(int fd, const std::string& name) {
   send_str(fd, r);
 }
 
-void WebServer::serve_stream(int fd) {
+void WebServer::serve_stream(int fd, int cam, bool thumb) {
   const std::string header =
       "HTTP/1.1 200 OK\r\n"
       "Connection: close\r\n"
       "Cache-Control: no-store\r\n"
       "Pragma: no-cache\r\n"
       "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
-  if (!send_str(fd, header)) return;
+  // 先记下"有人在看", 再发 header.
+  // 反过来的话, 头几帧会因为没人看而不编码, 客户端要等下一帧才有画面.
+  if (thumb) ++thumb_viewers_[cam];
+  else ++full_viewers_[cam];
+
+  if (!send_str(fd, header)) {
+    if (thumb) --thumb_viewers_[cam];
+    else --full_viewers_[cam];
+    return;
+  }
 
   uint64_t last = 0;
   while (running_) {
     std::vector<uchar> data;
     {
-      std::unique_lock<std::mutex> lk(frame_mu_);
+      std::unique_lock<std::mutex> lk(frame_mu_[cam]);
       // 最多等 2 秒, 没新帧就再查一次 running_, 免得 stop 之后卡死在这
-      frame_cv_.wait_for(lk, std::chrono::seconds(2),
-                         [&] { return frame_seq_ != last || !running_; });
+      frame_cv_[cam].wait_for(lk, std::chrono::seconds(2),
+                              [&] { return frame_seq_[cam] != last || !running_; });
       if (!running_) break;
-      if (frame_seq_ == last) continue;
-      last = frame_seq_;
-      data = jpeg_;   // 拷一份再出锁, 别让它占着锁写网络
+      if (frame_seq_[cam] == last) continue;
+      last = frame_seq_[cam];
+      data = thumb ? thumb_jpeg_[cam] : jpeg_[cam];   // 拷一份再出锁
     }
     if (data.empty()) continue;
 
@@ -504,4 +575,6 @@ void WebServer::serve_stream(int fd) {
     if (!send_all(fd, data.data(), data.size())) break;
     if (!send_str(fd, "\r\n")) break;
   }
+  if (thumb) --thumb_viewers_[cam];
+  else --full_viewers_[cam];
 }

@@ -16,6 +16,9 @@
 
 #include "detection.hpp"   // Detection 定义在这里, 和 ONNX 版共用
 
+// 静默开关: 关掉后 detector 不再往终端打印(多路并行时用)
+void rknn_set_verbose(bool on);
+
 class RknnDetector {
  public:
   // model_path 指向 .rknn 文件（不是 .onnx）

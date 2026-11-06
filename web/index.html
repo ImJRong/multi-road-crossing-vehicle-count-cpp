@@ -59,7 +59,21 @@
 
   .slider { margin-bottom: 10px; }
   .slider .lab { display: flex; justify-content: space-between; font-size: 12px; color: #6B7280; margin-bottom: 2px; }
-  .slider input[type=range] { width: 100%; accent-color: #185FA5; }
+  .slider input[type=number] { width: 100%; box-sizing: border-box; padding: 6px 8px; font-size: 13px;
+    border: 1px solid #E8EAED; border-radius: 6px; color: #2C2C2A; background: #fff; }
+  .slider input[type=number]:focus { outline: none; border-color: #185FA5; }
+
+  .sys { font-size: 12px; color: #6B7280; display: grid; gap: 5px; }
+  .hint { display: inline-flex; align-items: center; justify-content: center;
+    width: 13px; height: 13px; border-radius: 50%; background: #E8EAED; color: #6B7280;
+    font-size: 9px; cursor: help; margin-left: 3px; vertical-align: middle; position: relative; }
+  .hint::after { content: attr(data-tip); position: absolute; left: 50%; bottom: 130%;
+    transform: translateX(-50%); background: #2C2C2A; color: #fff; font-size: 11px;
+    line-height: 1.5; padding: 6px 9px; border-radius: 6px; white-space: nowrap;
+    opacity: 0; pointer-events: none; transition: opacity .12s; z-index: 50; }
+  .hint:hover::after { opacity: 1; }
+  .sys div { display: flex; justify-content: space-between; }
+  .sys b { color: #2C2C2A; font-weight: 500; }
 
   .events { background: #fff; border: 1px solid #E8EAED; border-radius: 10px; padding: 10px 12px; height: 158px; display: flex; flex-direction: column; }
   .events .head { font-size: 12px; font-weight: 500; color: #6B7280; margin-bottom: 8px; display: flex; justify-content: space-between; }
@@ -118,12 +132,23 @@
       <div class="card">
         <h4>参数（改内存，不动 json）</h4>
         <div class="slider">
-          <div class="lab"><span>置信度 conf</span><span id="v-conf">0.30</span></div>
-          <input type="range" id="s-conf" min="5" max="95" value="30">
+          <div class="lab"><span>置信度 conf</span></div>
+          <input type="number" id="s-conf" min="0.05" max="0.95" step="0.01" value="0.50">
         </div>
         <div class="slider">
-          <div class="lab"><span>NMS iou</span><span id="v-iou">0.50</span></div>
-          <input type="range" id="s-iou" min="5" max="95" value="50">
+          <div class="lab"><span>NMS iou</span></div>
+          <input type="number" id="s-iou" min="0.05" max="0.95" step="0.01" value="0.30">
+        </div>
+      </div>
+
+      <div class="card">
+        <h4>系统状态</h4>
+        <div class="sys">
+          <div><span>CPU 占用</span><b id="v-cpu">--</b></div>
+          <div><span>温度</span><b id="v-temp">--</b></div>
+          <div><span>NPU 频率</span><b id="v-npu">--</b></div>
+          <div><span>NPU 三核负载 <span class="hint" data-tip="状态不显示？去 README 找 chmod 命令">!</span></span><b id="v-npuload">--</b></div>
+          <div><span>GPU 频率</span><b id="v-gpu">--</b></div>
         </div>
       </div>
     </aside>
@@ -237,15 +262,29 @@ document.querySelectorAll('.row input').forEach(el => {
   };
 });
 
-let lastConf = 30, lastIou = 50, paramTimer = null;
+let lastConf = 50, lastIou = 30, paramTimer = null;
 function pushParam() {
   clearTimeout(paramTimer);
   paramTimer = setTimeout(() => {
     jget('/api/param?conf=' + (lastConf / 100).toFixed(2) + '&iou=' + (lastIou / 100).toFixed(2));
   }, 150);
 }
-$('s-conf').oninput = e => { lastConf = +e.target.value; $('v-conf').textContent = (lastConf / 100).toFixed(2); pushParam(); };
-$('s-iou').oninput = e => { lastIou = +e.target.value; $('v-iou').textContent = (lastIou / 100).toFixed(2); pushParam(); };
+$('s-conf').onchange = e => {
+  let v = parseFloat(e.target.value);
+  if (isNaN(v)) { e.target.value = (lastConf / 100).toFixed(2); return; }
+  v = Math.min(0.95, Math.max(0.05, v));
+  e.target.value = v.toFixed(2);
+  lastConf = Math.round(v * 100);
+  pushParam();
+};
+$('s-iou').onchange = e => {
+  let v = parseFloat(e.target.value);
+  if (isNaN(v)) { e.target.value = (lastIou / 100).toFixed(2); return; }
+  v = Math.min(0.95, Math.max(0.05, v));
+  e.target.value = v.toFixed(2);
+  lastIou = Math.round(v * 100);
+  pushParam();
+};
 
 function pollState() {
   jget('/api/state').then(s => {
@@ -259,11 +298,16 @@ function pollState() {
       syncParams = false;
       lastConf = Math.round(s.conf * 100);
       lastIou = Math.round(s.iou * 100);
-      $('s-conf').value = lastConf;
-      $('s-iou').value = lastIou;
-      $('v-conf').textContent = s.conf.toFixed(2);
-      $('v-iou').textContent = s.iou.toFixed(2);
+      $('s-conf').value = s.conf.toFixed(2);
+      $('s-iou').value = s.iou.toFixed(2);
     }
+
+    $('v-cpu').textContent = (s.cpu ?? 0).toFixed(1) + '%';
+    $('v-temp').textContent = (s.temp ?? 0).toFixed(1) + ' ℃';
+    $('v-npu').textContent = (s.npu ?? 0) + ' MHz';
+    const nl = s.npu_load || [0,0,0];
+    $('v-npuload').textContent = nl.join('% / ') + '%';
+    $('v-gpu').textContent = (s.gpu ?? 0) + ' MHz';
 
     $('tracks').textContent = s.tracks ?? 0;
     $('fps').textContent = (s.fps ?? 0).toFixed(1);
