@@ -113,6 +113,8 @@ traffic_count/
 ├── CMakeLists.txt          主构建脚本（命令行版 + rknn_probe / multi_eval / pipeline_bench）
 ├── web.cmake               网页版构建脚本（traffic_web_single / traffic_web_quad）
 ├── README.md               本文件
+├── LICENSE                 学术使用许可（Academic Use Only）
+├── .gitattributes          统一行尾（仓库内 LF）
 ├── docs/
 │   └── 技术文档.md         设计推导、实测数据、算法细节、踩坑记录
 ├── configs/                每个监控点一份 JSON（不入库，随部署生成）
@@ -419,6 +421,7 @@ anchor + 右距离          刻度 0.327
 | 相关仓库 | https://github.com/ImJRong/multi-road-crossing-vehicle-count （Python 原型与模型转换） |
 | 日期 | 2026-11-06 |
 
-**License**：仅供学术研究（Academic Use Only）。未经作者书面许可，不得用于商业用途、不得再分发与对外提供服务。
+**License**：仅供学术研究（Academic Use Only）。完整条款见 [LICENSE](LICENSE)。
+未经作者书面许可，不得用于商业用途、不得再分发与对外提供服务。
 
 模型基于 UA-DETRAC 数据集微调，数据集版权归原作者所有。YOLOv8 采用 Ultralytics 开源实现，遵循其 AGPL-3.0 许可。
