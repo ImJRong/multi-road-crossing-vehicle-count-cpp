@@ -115,17 +115,24 @@ traffic_count/
 ├── README.md               本文件
 ├── LICENSE                 学术使用许可（Academic Use Only）
 ├── .gitattributes          统一行尾（仓库内 LF）
-├── docs/
-│   ├── 文档索引.md         按问题导航：想知道什么该看哪一份
+├── docs/                   文档，见本节下方「配套文档」
+│   ├── MEMORY.md           交接文档：状态、连接、编译运行、踩坑、性能实测
+│   ├── head4_原理详解.md   框偏移原理推导（11 节 11 图）
 │   ├── 技术文档.md         设计推导、实测数据、算法细节、踩坑记录
-│   └── 代码走读.md         逐文件逐函数讲解：每个函数干什么、为什么这么写
-├── configs/                每个监控点一份 JSON（不入库，随部署生成）
+│   ├── 代码走读.md         逐文件逐函数讲解：每个函数干什么、为什么这么写
+│   ├── 实操手册.md         训练数据准备、参数标定、量化实验
+│   ├── INT8验证方案.md     INT8 掉了多少精度（含实测结论）
+│   ├── 设计要点.md         待做改进清单（已标完成情况）
+│   ├── tools脚本清单.md    转换 / 诊断脚本怎么用
+│   ├── figures/            原理图 11 张
+│   └── screenshots/        误差实测截图 3 张
+├── configs/                每个监控点一份 JSON，随仓库提供
 │   └── test1.json ~ test4.json
 ├── data/
-│   └── videos/             原始路口视频 test1~test4（不入库）
+│   └── videos/             原始路口视频 test1~test4（不入库，需自备）
 ├── models/
-│   ├── best_detrac.onnx    ONNX 模型（中转用）
-│   └── best_detrac.rknn    板端模型（head4，INT8）
+│   ├── best_detrac.onnx    ONNX 模型（中转用，仅仓库里有）
+│   └── best_detrac.rknn    板端模型（head4，INT8，5.7 MB）
 ├── src/                    核心源码，共 4983 行
 │   ├── main.cpp            命令行入口
 │   ├── web_main_single.cpp 网页版入口（单路）
@@ -146,28 +153,31 @@ traffic_count/
 ├── web/
 │   ├── index.html          单路监控台
 │   └── quad.html           四路分屏
-└── tools/
-    └── convert_v6.py       模型转换脚本
+└── output/                 运行产物：结果视频、CSV、抓拍图（不入库）
 ```
 
 **配套文档**
 
 | 想知道什么 | 去哪 |
 |---|---|
-| **不知道看哪个文档** | [docs/文档索引.md](docs/文档索引.md) |
+| **接手项目，先看哪一份** | [docs/MEMORY.md](docs/MEMORY.md) |
 | 设计推导、实测原始数据、算法细节、踩坑记录 | [docs/技术文档.md](docs/技术文档.md) |
 | 代码怎么读、每个函数在干什么 | [docs/代码走读.md](docs/代码走读.md) |
-| 框偏移的原理推导（11 张图） | Python 版仓库 [docs/head4_原理详解.md](https://github.com/ImJRong/multi-road-crossing-vehicle-count/blob/main/docs/head4_%E5%8E%9F%E7%90%86%E8%AF%A6%E8%A7%A3.md) |
-| 完整踩坑记录与交接文档 | Python 版仓库 [MEMORY.md](https://github.com/ImJRong/multi-road-crossing-vehicle-count/blob/main/MEMORY.md) |
+| 框偏移的原理推导（11 张图） | [docs/head4_原理详解.md](docs/head4_原理详解.md) |
+| 训练数据准备、参数标定、量化实验 | [docs/实操手册.md](docs/实操手册.md) |
+| 转换 / 诊断脚本怎么用 | [docs/tools脚本清单.md](docs/tools脚本清单.md) |
 | Python 原型（同类算法的参照实现） | [multi-road-crossing-vehicle-count](https://github.com/ImJRong/multi-road-crossing-vehicle-count) |
 
 ## 六、编译 / 运行 / 部署
 
 ### 6.1 板端编译（RKNN 后端）
 
+板子无外网，代码从 PC 侧传过去：
+
 ```bash
-# 1. 取代码
-git clone https://github.com/ImJRong/multi-road-crossing-vehicle-count-cpp.git ~/code
+# 1. 把代码放到 ~/code
+#    从 WSL 仓库同步（代码正本在 WSL 仓库 ~/traffic_count）
+#    或在 PC 上执行: scp -r traffic_count/* orangepi@192.168.1.105:~/code/
 cd ~/code
 
 # 2. 确认依赖存在
@@ -178,6 +188,8 @@ pkg-config --modversion opencv4   # 必须返回 4.x
 cmake . -DUSE_RKNN=ON -DRKNN_ROOT=/usr -DTRAFFIC_PROJECT_ROOT=~/code
 make -j4
 ```
+
+> `~/code` 不是 git 仓库，代码改了要手动同步回 WSL 仓库 `~/traffic_count` 再提交。
 
 编出以下可执行文件：
 
@@ -199,10 +211,11 @@ make -j4
 
 配置读 `$TRAFFIC_PROJECT_ROOT/configs/testN.json`，视频路径写在配置里。
 
+`configs/test1.json` ~ `test4.json` 随仓库提供，直接用。只需要自备视频：
+
 ```bash
-mkdir -p configs data/videos
+mkdir -p data/videos
 # 把 test1.mp4 ~ test4.mp4 放进 data/videos/
-# 把对应的 test1.json ~ test4.json 放进 configs/
 ```
 
 配置文件结构见 §七 模块说明中的「配置模块」。
@@ -331,6 +344,20 @@ impl_->boxes_is_dist = std::string(a.name).find("dfl") != std::string::npos;
 | `multi_eval` | 多路并行跑完整视频，输出计数统计 CSV，用于量化比较两个模型 |
 | `pipeline_bench` | 并行推理 + 串行跟踪的流水线压测，支持 `--realtime N` 模拟实时摄像头节奏 |
 
+### 8. 模型转换流程（离线，在 PC / WSL 侧做，不在板子上）
+
+**作用**：把训练好的 ONNX 转成板端能跑的 RKNN INT8 模型。
+
+**实现原理**：三步。
+
+1. **改输出头**：原 YOLOv8 ONNX 输出的是最终坐标（值域 0~640）。转换时把 `Concat` / `Mul` 之后的 9 个节点（Slice×2 / Sub×2 / Add×2 / Div / Concat / Mul）删掉，让 `/model.22/dfl/Reshape_1_output_0` 直接成为图输出。这样模型吐的是 DFL 距离（值域 0~15），坐标换算搬到 C++ 里做。这 9 个节点无权重，删掉不改变任何参数。
+2. **INT8 量化**：rknn-toolkit2 1.6.0（WSL env `rknn16`），`target_platform='rk3588'`，`mean_values=[[0,0,0]]`、`std_values=[[255,255,255]]`，校准集 300 张（4 个视频各 75 张，`D:\rknn_calib`）。
+3. **板端验证**：`./rknn_probe models/xxx.rknn data/videos/test1.mp4 200` 检查张量形状、`scale`、`zp` 与实跑值；再用 `./traffic_count test1` 跑完整视频，与 FP32 结果逐框比对。
+
+**关键技术点**：**必须让 DFL 距离单独成为模型输出**。若沿用原模型的坐标输出，RKNN 会把 0~15 的距离和 0~640 的坐标塞进同一套量化参数，刻度被撑到 2.5，距离只剩 6 个有效台阶，框整体向左上偏移、越远越严重。改造后距离的量化刻度是 0.047，中心偏移从 6.75 px 降到 0.03 px。完整推导见 [docs/head4_原理详解.md](docs/head4_原理详解.md)。
+
+转换脚本在 WSL 仓库 `~/traffic_count/tools/`，不在板子上；用法见 [docs/tools脚本清单.md](docs/tools脚本清单.md)。板端 C++ 侧按输出张量名是否含 `"dfl"` 自动识别，因此 head3 / head4 模型都能直接跑，不需要重新编译。
+
 ## 八、关键技术难点与解决方案
 
 ### 难点一：INT8 量化导致检测框整体向左上偏移
@@ -406,6 +433,7 @@ anchor + 右距离          刻度 0.327
 
 | 版本 | 日期 | 内容 |
 |---|---|---|
+| v1.0.1 | 2026-11-07 | 文档整理：docs 精简为 8 份、删归档；抓拍图改为启动时清空；模型目录只留一个；源码补头注释；README 修正与实际不符的条目 |
 | v1.0.0 | 2026-11-06 | 完成四路并行分屏网页版（`traffic_web_quad`）；参数初值改为从配置文件读取；补齐 README 工程文档 |
 | v0.9.0 | 2026-11-02 | 修复框偏移：模型输出改为 DFL 距离，中心偏移 6.75 px → 0.03 px；修复计数漏（断号下降 34.3%） |
 | v0.8.0 | 2026-11-01 | 修复计数记录只增不删的内存泄漏；删除跟踪输出上的多余 EMA 平滑；模型转换配方定型 |
@@ -423,7 +451,7 @@ anchor + 右距离          刻度 0.327
 | 作者 | jiarong（RONGG） |
 | 仓库 | https://github.com/ImJRong/multi-road-crossing-vehicle-count-cpp |
 | 相关仓库 | https://github.com/ImJRong/multi-road-crossing-vehicle-count （Python 原型与模型转换） |
-| 日期 | 2026-11-06 |
+| 日期 | 2026-11-07 |
 
 **License**：仅供学术研究（Academic Use Only）。完整条款见 [LICENSE](LICENSE)。
 未经作者书面许可，不得用于商业用途、不得再分发与对外提供服务。
